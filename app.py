@@ -1,4 +1,4 @@
-import os, io, re, json, tempfile
+import os, io, re, json, tempfile, base64
 from datetime import date, timedelta
 from difflib import SequenceMatcher
 import streamlit as st
@@ -374,7 +374,6 @@ def excel_export(report_date, data, df, history):
         daily_detail.to_excel(writer, sheet_name="Detailed Audit", index=False)
         wtd_loc.to_excel(writer, sheet_name="WTD by Location", index=False)
         wtd_item.to_excel(writer, sheet_name="WTD by Item", index=False)
-        history.to_excel(writer, sheet_name="Audit History", index=False)
 
         wb = writer.book
         dark = "2B2B2B"; light = "F2F2F2"; accent = "D9EAF7"; white = "FFFFFF"
@@ -480,7 +479,6 @@ if pick:
 
 st.markdown("### 2️⃣ Verified Outs")
 verified_file=st.file_uploader("Upload Verified Outs",type=["xlsx","xls","csv","pdf","png","jpg","jpeg"],key="verified_outs_upload")
-prior_history=st.file_uploader("Optional: Upload prior OOS Audit History CSV for Week-to-Date",type=["csv"],help="Upload the history CSV downloaded from the prior audit. The app combines it with today's audit and reports Monday through the selected audit date.")
 
 with st.expander("Manager settings"):
     threshold=st.slider("Product match threshold",.70,1.0,.86,.01)
@@ -517,12 +515,17 @@ if "data" in st.session_state:
     with tab2: st.dataframe(df,use_container_width=True,hide_index=True)
     with tab3: st.dataframe(pd.DataFrame({"Verified OOS — Column A":vo}),use_container_width=True,hide_index=True)
 
-    today_hist=current_history(rd,data,df); history=combine_history(prior_history,today_hist)
+    today_hist=current_history(rd,data,df)
+    # Keep WTD data in the current Streamlit session without showing a separate history area.
+    if "wtd_history" not in st.session_state:
+        st.session_state.wtd_history = today_hist.copy()
+    else:
+        st.session_state.wtd_history = combine_history(None, pd.concat([st.session_state.wtd_history, today_hist], ignore_index=True))
+    history=st.session_state.wtd_history.copy()
     monday=rd-timedelta(days=rd.weekday()); wtd=history[(history.Date>=monday)&(history.Date<=rd)].copy(); wtd=wtd[pd.to_datetime(wtd.Date).dt.weekday<5]
     st.subheader("Download Reports")
     st.download_button("⬇️ OOS ANALYSIS PDF",analysis_pdf(data,df),f"OOS_Analysis_{rd}.pdf","application/pdf")
     st.download_button("⬇️ FALSE OOS — REPICK LIST",repick_pdf(df),f"False_OOS_Repick_{rd}.pdf","application/pdf")
     st.download_button("⬇️ WEEK-TO-DATE OOS PDF",wtd_pdf(history,rd),f"OOS_WTD_{monday}_to_{rd}.pdf","application/pdf")
-    st.download_button("⬇️ COMPLETE EXCEL WORKBOOK",excel_export(rd,data,df,history),f"OOS_Audit_{rd}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",help="One workbook containing daily summaries, item quantity/frequency, false OOS repick, detailed audit data, WTD analysis and audit history.")
-    st.download_button("⬇️ OOS AUDIT HISTORY CSV",history.to_csv(index=False).encode("utf-8"),"OOS_Audit_History.csv","text/csv",help="Save this file and upload it with the next day's audit to keep the Monday-Friday WTD report building.")
+    st.download_button("⬇️ COMPLETE EXCEL WORKBOOK",excel_export(rd,data,df,history),f"OOS_Audit_{rd}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",help="One workbook containing daily summaries, item quantity/frequency, false OOS repick, detailed audit data and WTD analysis.")
     st.caption(f"WTD window: {monday:%A %m/%d} through {rd:%A %m/%d}. Saturday/Sunday records are excluded.")

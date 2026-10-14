@@ -1,4 +1,4 @@
-import os, io, re, json, tempfile, base64, mimetypes
+import os, io, re, json, tempfile
 from datetime import date, timedelta
 from difflib import SequenceMatcher
 import streamlit as st
@@ -62,68 +62,37 @@ def upload_for_model(client, uploaded):
 
 
 def verified_outs(uploaded, client, model):
-    # Excel/CSV never need the AI API. Read Column A directly.
     n = uploaded.name.lower()
-    raw = uploaded.getvalue()
     if n.endswith((".xlsx", ".xls")):
-        df = pd.read_excel(io.BytesIO(raw), header=None)
+        df = pd.read_excel(io.BytesIO(uploaded.getvalue()), header=None)
         return [str(v).strip() for v in df.iloc[:, 0].dropna() if str(v).strip()]
     if n.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(raw), header=None)
+        df = pd.read_csv(io.BytesIO(uploaded.getvalue()), header=None)
         return [str(v).strip() for v in df.iloc[:, 0].dropna() if str(v).strip()]
-
-    instruction = (
-        'Read this Verified Outs sheet. Anything in the LEFT COLUMN / Column A is a verified OOS item. '
-        'Ignore Column B and every other column, including notes/status. Return JSON only in exactly this shape: '
-        '{"verified_outs":["item 1","item 2"]}'
-    )
-
-    # Images must be sent as image input, not as a generic input_file.
-    if n.endswith((".png", ".jpg", ".jpeg")):
-        mime = "image/png" if n.endswith(".png") else "image/jpeg"
-        data_url = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
-        r = client.responses.create(
-            model=model,
-            input=[{"role":"user","content":[
-                {"type":"input_image","image_url":data_url},
-                {"type":"input_text","text":instruction}
-            ]}]
-        )
-    elif n.endswith(".pdf"):
-        # PDFs use the Files API + input_file.
-        fid = upload_for_model(client, uploaded)
-        r = client.responses.create(
-            model=model,
-            input=[{"role":"user","content":[
-                {"type":"input_file","file_id":fid},
-                {"type":"input_text","text":instruction}
-            ]}]
-        )
-    else:
-        raise ValueError("Unsupported Verified Outs file type. Use XLSX, XLS, CSV, PDF, PNG, JPG, or JPEG.")
-
-    parsed = parse_json(r.output_text)
-    return [str(v).strip() for v in parsed.get("verified_outs", []) if str(v).strip()]
-
-
-def pick_data(uploaded, client, model):
     fid = upload_for_model(client, uploaded)
-    prompt = """Read these vending/micro-market pick sheets carefully.
+    r = client.responses.create(model=model, input=[{"role":"user","content":[
+        {"type":"input_file","file_id":fid},
+        {"type":"input_text","text":'Read this Verified Outs sheet. Anything in the LEFT COLUMN / Column A is a verified OOS item. Ignore Column B and all other columns. Return JSON only: {"verified_outs":["item 1","item 2"]}'}]}])
+    return parse_json(r.output_text).get("verified_outs", [])
+
+
+def pick_data(uploaded_files, client, model):
+    # Accept one PDF, one photo, or multiple photos/PDFs from a phone camera/gallery.
+    if not isinstance(uploaded_files, (list, tuple)):
+        uploaded_files = [uploaded_files]
+    content = []
+    for uploaded in uploaded_files:
+        fid = upload_for_model(client, uploaded)
+        content.append({"type":"input_file","file_id":fid})
+    prompt = """Read all attached vending/micro-market pick sheets carefully. Attachments may be PDFs or phone photos, and multiple photos may be consecutive pages of the same pick list. Treat all attachments as one audit batch and consolidate pages belonging to the same order/account.
+Only lines explicitly marked OS count as out of stock. Checkmarks, blanks, partial fills, quantities written for fills, and other notes are not OS.
+Do not double-count cumulative printed totals on continuation pages.
 Return JSON only:
 {"orders":[{"account":"name","picker":"name if visible","pages":[1],"total_ordered":123,
-"all_products":["Twix Caramel Cookie Bar","Snickers","Pepsi 20oz","Coke 20oz"],
 "os_lines":[{"product":"full product name","ordered_qty":5,"page":1,"confidence":0.98}]}]}
-Rules:
-- Consolidate continuation pages for the same account/order.
-- Determine total ordered units without double-counting cumulative totals printed on continuation pages.
-- all_products MUST contain every distinct product/SKU ordered for that account across all of its pages, whether in stock or OOS. Do not include headings, totals, or notes. Consolidate duplicate product names within the same account.
-- Count an item as OOS ONLY if the fills/handwritten area explicitly says OS or unmistakably indicates OS.
-- Do not treat blanks, checkmarks, partial-fill numbers, or unrelated notes as OS.
-- ordered_qty is the quantity ordered for the OS line, not the partial fill.
-- confidence below 0.85 when handwriting/product identification is uncertain.
-- Preserve product distinctions: e.g. Cheetos Flamin Hot and Chester Flamin Hot Fries are different products.
-"""
-    r = client.responses.create(model=model, input=[{"role":"user","content":[{"type":"input_file","file_id":fid},{"type":"input_text","text":prompt}]}])
+Use the ordered quantity for each OS line, not a handwritten filled quantity. If handwriting or product text is uncertain, lower confidence rather than guessing."""
+    content.append({"type":"input_text","text":prompt})
+    r = client.responses.create(model=model, input=[{"role":"user","content":content}])
     return parse_json(r.output_text)
 
 
@@ -164,34 +133,7 @@ def add_table(story, headers, rows, widths, font=8, total_row=True):
     t.setStyle(ts); story.append(t)
 
 
-def product_availability(data, df):
-    """Unique-SKU availability overall and by location. Quantity is intentionally ignored."""
-    by_location = []
-    all_products = set()
-    all_oos = set()
-    for o in data.get("orders", []):
-        account = o.get("account", "Unknown")
-        products = {str(x).strip() for x in o.get("all_products", []) if str(x).strip()}
-        # Backward-compatible fallback for older extraction results.
-        if not products:
-            products = {str(x.get("product", "")).strip() for x in o.get("os_lines", []) if str(x.get("product", "")).strip()}
-        if len(df):
-            oos_products = {str(x).strip() for x in df.loc[df.Account == account, "Product"].dropna().tolist() if str(x).strip()}
-        else:
-            oos_products = set()
-        total = len(products)
-        oos_n = len(oos_products)
-        by_location.append({"Location": account, "Unique Products": total, "Unique OOS Products": oos_n,
-                            "Product In-Stock %": ((total-oos_n)/total if total else 0),
-                            "Product OOS %": (oos_n/total if total else 0)})
-        all_products.update(products)
-        all_oos.update(oos_products)
-    total_unique = len(all_products)
-    oos_unique = len(all_oos)
-    return by_location, total_unique, oos_unique
-
-
-def summary_kpis(story, total_ordered, os_units, false_units, false_lines, total_unique=0, oos_unique=0):
+def summary_kpis(story, total_ordered, os_units, false_units, false_lines):
     pct = os_units / total_ordered * 100 if total_ordered else 0
     k = [["TOTAL UNITS ORDERED","OOS UNITS","OOS %","FALSE OOS UNITS"],
          [f"{total_ordered:,}",f"{os_units:,}",f"{pct:.2f}%",f"{false_units:,}"]]
@@ -201,113 +143,47 @@ def summary_kpis(story, total_ordered, os_units, false_units, false_lines, total
                            ("FONTNAME",(0,1),(-1,1),"Helvetica-Bold"),("FONTSIZE",(0,1),(-1,1),15),
                            ("BOX",(0,0),(-1,-1),.5,colors.grey),("INNERGRID",(0,0),(-1,-1),.3,colors.grey),
                            ("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7)]))
-    story += [t, Spacer(1,7)]
-    product_oos_pct = oos_unique / total_unique * 100 if total_unique else 0
-    product_in_pct = 100 - product_oos_pct if total_unique else 0
-    u = [["UNIQUE PRODUCTS","UNIQUE PRODUCTS OOS","PRODUCT IN-STOCK %","PRODUCT OOS %"],
-         [f"{total_unique:,}",f"{oos_unique:,}",f"{product_in_pct:.2f}%",f"{product_oos_pct:.2f}%"]]
-    ut = Table(u, colWidths=[1.75*inch]*4)
-    ut.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),DARK),("TEXTCOLOR",(0,0),(-1,0),colors.white),
-                           ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("ALIGN",(0,0),(-1,-1),"CENTER"),
-                           ("FONTNAME",(0,1),(-1,1),"Helvetica-Bold"),("FONTSIZE",(0,1),(-1,1),15),
-                           ("BOX",(0,0),(-1,-1),.5,colors.grey),("INNERGRID",(0,0),(-1,-1),.3,colors.grey),
-                           ("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7)]))
-    story += [ut, Spacer(1,14)]
+    story += [t, Spacer(1,14)]
 
 
 def analysis_pdf(data, df, title="Out-of-Stock Analysis", subtitle="Only pick-sheet lines explicitly marked OS are counted."):
     b = io.BytesIO(); styles = getSampleStyleSheet()
-    h2 = ParagraphStyle("h2x", parent=styles["Heading2"], fontSize=12.5, leading=14, spaceBefore=5, spaceAfter=4)
-    # Portrait, intentionally compact so the complete daily report stays on one sheet.
-    doc = SimpleDocTemplate(b, pagesize=letter, leftMargin=20, rightMargin=20, topMargin=18, bottomMargin=18)
-    title_style = ParagraphStyle("ptitle", parent=styles["Title"], fontSize=19, leading=21, spaceAfter=2)
-    sub_style = ParagraphStyle("psub", parent=styles["BodyText"], alignment=TA_CENTER, fontSize=8.5, leading=10)
-    story = [Paragraph(title, title_style), Paragraph(subtitle, sub_style), Spacer(1,7)]
+    h2 = ParagraphStyle("h2x", parent=styles["Heading2"], fontSize=15, leading=18, spaceBefore=8, spaceAfter=7)
+    doc = SimpleDocTemplate(b, pagesize=landscape(letter), leftMargin=22, rightMargin=22, topMargin=22, bottomMargin=22)
+    story = [Paragraph(title, styles["Title"]), Paragraph(subtitle, ParagraphStyle("sub",parent=styles["BodyText"],alignment=TA_CENTER)), Spacer(1,12)]
     total_ordered = sum(int(o.get("total_ordered",0) or 0) for o in data.get("orders",[]))
     os_units = int(df.Qty.sum()) if len(df) else 0
     false_df = df[df.Status=="FALSE OOS / PICKING EXCEPTION"] if len(df) else df
     false_units = int(false_df.Qty.sum()) if len(false_df) else 0
-    prod_loc, total_unique, oos_unique = product_availability(data, df)
-    prod_map = {r["Location"]: r for r in prod_loc}
+    summary_kpis(story,total_ordered,os_units,false_units,len(false_df))
 
-    # Keep the existing overall unit KPI row.
-    pct = os_units / total_ordered * 100 if total_ordered else 0
-    k = [["TOTAL UNITS ORDERED","OOS UNITS","OOS %","FALSE OOS UNITS"],
-         [f"{total_ordered:,}",f"{os_units:,}",f"{pct:.2f}%",f"{false_units:,}"]]
-    t = Table(k, colWidths=[1.8*inch]*4, rowHeights=[.29*inch,.34*inch])
-    t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),DARK),("TEXTCOLOR",(0,0),(-1,0),colors.white),
-                           ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,0),7.5),
-                           ("ALIGN",(0,0),(-1,-1),"CENTER"),("FONTNAME",(0,1),(-1,1),"Helvetica-Bold"),
-                           ("FONTSIZE",(0,1),(-1,1),13),("BOX",(0,0),(-1,-1),.45,colors.grey),
-                           ("INNERGRID",(0,0),(-1,-1),.25,colors.grey),("TOPPADDING",(0,0),(-1,-1),3),
-                           ("BOTTOMPADDING",(0,0),(-1,-1),3)]))
-    story += [t, Spacer(1,4)]
-
-    # Keep the unique-product KPI row requested previously.
-    product_oos_pct = oos_unique / total_unique * 100 if total_unique else 0
-    product_in_pct = 100 - product_oos_pct if total_unique else 0
-    u = [["UNIQUE PRODUCTS","UNIQUE PRODUCTS OOS","PRODUCT IN-STOCK %","PRODUCT OOS %"],
-         [f"{total_unique:,}",f"{oos_unique:,}",f"{product_in_pct:.2f}%",f"{product_oos_pct:.2f}%"]]
-    ut = Table(u, colWidths=[1.8*inch]*4, rowHeights=[.29*inch,.34*inch])
-    ut.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),DARK),("TEXTCOLOR",(0,0),(-1,0),colors.white),
-                           ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,0),7.5),
-                           ("ALIGN",(0,0),(-1,-1),"CENTER"),("FONTNAME",(0,1),(-1,1),"Helvetica-Bold"),
-                           ("FONTSIZE",(0,1),(-1,1),13),("BOX",(0,0),(-1,-1),.45,colors.grey),
-                           ("INNERGRID",(0,0),(-1,-1),.25,colors.grey),("TOPPADDING",(0,0),(-1,-1),3),
-                           ("BOTTOMPADDING",(0,0),(-1,-1),3)]))
-    story += [ut, Spacer(1,6)]
-
-    # Existing unique-product availability by location, kept as its own table.
-    story.append(Paragraph("Product Availability by Location", h2))
-    prod_rows=[]
-    for o in data.get("orders",[]):
-        account=o.get("account","Unknown"); pm=prod_map.get(account,{})
-        up=int(pm.get("Unique Products",0)); uo=int(pm.get("Unique OOS Products",0))
-        prod_rows.append([account,up,uo,f"{(pm.get('Product In-Stock %',0)*100):.2f}%",f"{(pm.get('Product OOS %',0)*100):.2f}%"])
-    prod_rows.sort(key=lambda r: float(r[4][:-1]), reverse=True)
-    prod_rows.append(["TOTAL",total_unique,oos_unique,f"{product_in_pct:.2f}%",f"{product_oos_pct:.2f}%"])
-    add_table(story,["Location","Unique Products","Unique OOS","In-Stock %","OOS %"],prod_rows,
-              [2.65*inch,1.18*inch,1.05*inch,1.15*inch,1.05*inch],6.5)
-    story.append(Spacer(1,4))
-
-    # Add the original large unit-based location table from the user's example as a separate table underneath.
-    story.append(Paragraph("Out-of-Stock Percentage by Location", h2))
+    story.append(Paragraph("1. Out-of-Stock Percentage by Location", h2))
     loc=[]
     for o in data.get("orders",[]):
-        ordered=int(o.get("total_ordered",0) or 0)
-        oq=sum(int(x.get("ordered_qty",0) or 0) for x in o.get("os_lines",[]))
-        account=o.get("account","Unknown")
-        loc.append([account,ordered,oq,f"{(oq/ordered*100 if ordered else 0):.2f}%"])
+        ordered=int(o.get("total_ordered",0) or 0); oq=sum(int(x.get("ordered_qty",0) or 0) for x in o.get("os_lines",[]))
+        loc.append([o.get("account","Unknown"),ordered,oq,f"{(oq/ordered*100 if ordered else 0):.2f}%"])
     loc.sort(key=lambda r: float(r[3][:-1]), reverse=True)
     loc.append(["TOTAL",total_ordered,os_units,f"{(os_units/total_ordered*100 if total_ordered else 0):.2f}%"])
-    add_table(story,["Location","Total Units Ordered","Units on OOS Lines","OOS %"],loc,
-              [3.25*inch,1.45*inch,1.45*inch,1.05*inch],6.5)
+    add_table(story,["Location","Total Units Ordered","Units on OOS Lines","OOS %"],loc,[3.5*inch,1.55*inch,1.55*inch,1.0*inch])
+    story += [Spacer(1,16), Paragraph("2. OOS by Individual Item Quantity", h2)]
 
-    doc.build(story); return b.getvalue()
-
-
-def item_oos_pdf(df, title="OOS Item Analysis"):
-    b=io.BytesIO(); styles=getSampleStyleSheet()
-    h2=ParagraphStyle("itemh2", parent=styles["Heading2"], fontSize=15, leading=18, spaceBefore=8, spaceAfter=7)
-    doc=SimpleDocTemplate(b,pagesize=landscape(letter),leftMargin=22,rightMargin=22,topMargin=22,bottomMargin=22)
-    story=[Paragraph(title,styles["Title"]), Paragraph("Standalone item-level OOS quantity and frequency report.", ParagraphStyle("itemsub",parent=styles["BodyText"],alignment=TA_CENTER)), Spacer(1,12)]
-    os_units=int(df.Qty.sum()) if len(df) else 0
-    story.append(Paragraph("1. OOS by Individual Item Quantity",h2))
     if len(df):
-        q=df.groupby("Product",dropna=False).agg(OS_Units=("Qty","sum"),Locations=("Account","nunique")).reset_index().sort_values(["OS_Units","Product"],ascending=[False,True])
-        qrows=[[i,r.Product,int(r.OS_Units),int(r.Locations),f"{(r.OS_Units/os_units*100 if os_units else 0):.1f}%"] for i,r in enumerate(q.itertuples(index=False),1)]
-        qrows.append(["","TOTAL",os_units,"","100.0%" if os_units else "0.0%"])
+        q = df.groupby("Product",dropna=False).agg(OS_Units=("Qty","sum"), Locations=("Account","nunique")).reset_index().sort_values(["OS_Units","Product"],ascending=[False,True])
+        qrows=[]
+        for i,r in enumerate(q.itertuples(index=False),1):
+            qrows.append([i,r.Product,int(r.OS_Units),int(r.Locations),f"{(r.OS_Units/os_units*100 if os_units else 0):.1f}%"])
+        qrows.append(["","TOTAL",os_units,"", "100.0%" if os_units else "0.0%"])
     else: qrows=[["","No OOS items",0,0,"0.0%"]]
     add_table(story,["Rank","Product","OOS Units","Locations OOS","% of OOS Units"],qrows,[.55*inch,4.4*inch,1.0*inch,1.0*inch,1.0*inch],7.5)
-    story += [Spacer(1,16),Paragraph("2. OOS by Item Frequency / Occurrences",h2)]
+
+    story += [Spacer(1,16), Paragraph("3. OOS by Item Frequency / Occurrences", h2)]
     if len(df):
-        f=df.groupby("Product",dropna=False).agg(Occurrences=("Product","size"),Locations=("Account","nunique"),OS_Units=("Qty","sum")).reset_index().sort_values(["Occurrences","OS_Units"],ascending=[False,False])
+        f = df.groupby("Product",dropna=False).agg(Occurrences=("Product","size"),Locations=("Account","nunique"),OS_Units=("Qty","sum")).reset_index().sort_values(["Occurrences","OS_Units"],ascending=[False,False])
         frows=[[i,r.Product,int(r.Occurrences),int(r.Locations),int(r.OS_Units)] for i,r in enumerate(f.itertuples(index=False),1)]
         frows.append(["","TOTAL",len(df),"",os_units])
     else: frows=[["","No OOS items",0,0,0]]
     add_table(story,["Rank","Product","OOS Occurrences","Locations OOS","OOS Units"],frows,[.55*inch,4.4*inch,1.1*inch,1.0*inch,1.0*inch],7.5)
     doc.build(story); return b.getvalue()
-
 
 
 def repick_pdf(df):
@@ -408,8 +284,6 @@ def excel_export(report_date, data, df, history):
     false_df = df[df.Status == "FALSE OOS / PICKING EXCEPTION"].copy() if len(df) else df.copy()
     false_units = int(false_df.Qty.sum()) if len(false_df) else 0
     os_pct = os_units / total_ordered if total_ordered else 0
-    prod_loc, total_unique, oos_unique = product_availability(data, df)
-    prod_map = {r["Location"]: r for r in prod_loc}
 
     # Daily location summary
     loc_rows = []
@@ -417,10 +291,7 @@ def excel_export(report_date, data, df, history):
         account = o.get("account", "Unknown")
         ordered = int(o.get("total_ordered", 0) or 0)
         oq = sum(int(x.get("ordered_qty", 0) or 0) for x in o.get("os_lines", []))
-        pm = prod_map.get(account, {})
-        loc_rows.append({"Location": account, "Total Units Ordered": ordered, "OOS Units": oq, "OOS %": oq / ordered if ordered else 0,
-                         "Unique Products": int(pm.get("Unique Products",0)), "Unique OOS Products": int(pm.get("Unique OOS Products",0)),
-                         "Product In-Stock %": pm.get("Product In-Stock %",0), "Product OOS %": pm.get("Product OOS %",0)})
+        loc_rows.append({"Location": account, "Total Units Ordered": ordered, "OOS Units": oq, "OOS %": oq / ordered if ordered else 0})
     daily_loc = pd.DataFrame(loc_rows)
     if len(daily_loc): daily_loc = daily_loc.sort_values(["OOS %", "OOS Units"], ascending=[False, False]).reset_index(drop=True)
 
@@ -475,10 +346,6 @@ def excel_export(report_date, data, df, history):
         ["Daily OOS %", os_pct],
         ["Daily False OOS Units", false_units],
         ["Daily False OOS Exceptions", len(false_df)],
-        ["Daily Unique Products", total_unique],
-        ["Daily Unique Products OOS", oos_unique],
-        ["Daily Product In-Stock %", (total_unique-oos_unique)/total_unique if total_unique else 0],
-        ["Daily Product OOS %", oos_unique/total_unique if total_unique else 0],
         ["WTD Total Units Ordered", wtd_ordered],
         ["WTD OOS Units", wtd_os_units],
         ["WTD OOS %", wtd_os_units / wtd_ordered if wtd_ordered else 0],
@@ -548,8 +415,46 @@ with st.expander("How it works", expanded=False):
     st.write("Column A of Verified Outs = verified OOS. Column B is notes only. An OS on a pick sheet that is not in Column A becomes a picking exception.")
 
 report_date=st.date_input("Audit date",value=date.today())
-pick=st.file_uploader("1️⃣ Upload Pick Sheets PDF",type=["pdf"])
-verified_file=st.file_uploader("2️⃣ Upload Verified Outs",type=["xlsx","xls","csv","pdf","png","jpg","jpeg"])
+
+# Pick sheets: employees can either take photos directly or select existing pictures/PDFs.
+if "camera_pick_photos" not in st.session_state:
+    st.session_state.camera_pick_photos = []
+
+st.markdown("### 1️⃣ Pick Sheets")
+photo_tab, file_tab = st.tabs(["📷 Take Picture", "🖼️ Select Pictures / Files"])
+with photo_tab:
+    camera_photo = st.camera_input("Take a picture of a picklist page", key="pick_camera")
+    if camera_photo is not None:
+        if st.button("➕ ADD THIS PHOTO", use_container_width=True):
+            raw = camera_photo.getvalue()
+            # Avoid adding the exact same capture twice.
+            if not any(x["data"] == raw for x in st.session_state.camera_pick_photos):
+                st.session_state.camera_pick_photos.append({"name": f"picklist_camera_{len(st.session_state.camera_pick_photos)+1}.jpg", "data": raw})
+                st.success(f"Photo added. {len(st.session_state.camera_pick_photos)} camera photo(s) ready.")
+            else:
+                st.info("That photo is already added.")
+    if st.session_state.camera_pick_photos:
+        st.caption(f"{len(st.session_state.camera_pick_photos)} camera photo(s) added. Take the next page and tap ADD THIS PHOTO again.")
+        if st.button("🗑️ CLEAR CAMERA PHOTOS", use_container_width=True):
+            st.session_state.camera_pick_photos = []
+            st.rerun()
+
+with file_tab:
+    selected_pick_files = st.file_uploader("Select existing pictures or PDF pick sheets",type=["pdf","png","jpg","jpeg","webp"],accept_multiple_files=True,help="Select one or multiple pictures/PDFs from the phone.",key="pick_file_upload")
+
+class MemoryUpload:
+    def __init__(self, name, data):
+        self.name = name
+        self._data = data
+    def getvalue(self):
+        return self._data
+
+pick = [MemoryUpload(x["name"], x["data"]) for x in st.session_state.camera_pick_photos] + list(selected_pick_files or [])
+if pick:
+    st.success(f"✅ {len(pick)} pick-sheet page/file(s) ready for audit.")
+
+st.markdown("### 2️⃣ Verified Outs")
+verified_file=st.file_uploader("Upload Verified Outs",type=["xlsx","xls","csv","pdf","png","jpg","jpeg"],key="verified_outs_upload")
 prior_history=st.file_uploader("Optional: Upload prior OOS Audit History CSV for Week-to-Date",type=["csv"],help="Upload the history CSV downloaded from the prior audit. The app combines it with today's audit and reports Monday through the selected audit date.")
 
 with st.expander("Manager settings"):
@@ -565,21 +470,8 @@ if not api_key: st.error("Server setup required: OPENAI_API_KEY has not been con
 if st.button("RUN AUDIT",type="primary",disabled=not(pick and verified_file and api_key)):
     client=OpenAI(api_key=api_key)
     with st.status("Reading audit...",expanded=True) as s:
-        st.write("Reading Verified Outs — Column A only...")
-        try:
-            vo=verified_outs(verified_file,client,model)
-        except Exception as e:
-            s.update(label="Verified Outs could not be read",state="error")
-            st.error(f"Verified Outs error: {e}")
-            st.stop()
-        st.write(f"{len(vo)} verified OOS items found.")
-        st.write("Reading pick sheets and handwritten OS marks...")
-        try:
-            data=pick_data(pick,client,model)
-        except Exception as e:
-            s.update(label="Pick sheets could not be read",state="error")
-            st.error(f"Pick sheet error: {e}")
-            st.stop()
+        st.write("Reading Verified Outs — Column A only..."); vo=verified_outs(verified_file,client,model); st.write(f"{len(vo)} verified OOS items found.")
+        st.write(f"Reading {len(pick)} pick-sheet file(s)/photo(s) and handwritten OS marks..."); data=pick_data(pick,client,model)
         st.session_state.update({"data":data,"vo":vo,"report_date":report_date}); s.update(label="Audit ready",state="complete")
 
 if "data" in st.session_state:
@@ -600,7 +492,6 @@ if "data" in st.session_state:
     monday=rd-timedelta(days=rd.weekday()); wtd=history[(history.Date>=monday)&(history.Date<=rd)].copy(); wtd=wtd[pd.to_datetime(wtd.Date).dt.weekday<5]
     st.subheader("Download Reports")
     st.download_button("⬇️ OOS ANALYSIS PDF",analysis_pdf(data,df),f"OOS_Analysis_{rd}.pdf","application/pdf")
-    st.download_button("⬇️ OOS ITEM ANALYSIS PDF",item_oos_pdf(df),f"OOS_Item_Analysis_{rd}.pdf","application/pdf")
     st.download_button("⬇️ FALSE OOS — REPICK LIST",repick_pdf(df),f"False_OOS_Repick_{rd}.pdf","application/pdf")
     st.download_button("⬇️ WEEK-TO-DATE OOS PDF",wtd_pdf(history,rd),f"OOS_WTD_{monday}_to_{rd}.pdf","application/pdf")
     st.download_button("⬇️ COMPLETE EXCEL WORKBOOK",excel_export(rd,data,df,history),f"OOS_Audit_{rd}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",help="One workbook containing daily summaries, item quantity/frequency, false OOS repick, detailed audit data, WTD analysis and audit history.")

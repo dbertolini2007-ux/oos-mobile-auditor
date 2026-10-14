@@ -247,10 +247,23 @@ def combine_history(prior_file, today_df):
     return h.drop_duplicates().reset_index(drop=True)
 
 
+def filter_wtd(history, report_date):
+    """Return Monday-Friday WTD rows with dates normalized to pandas Timestamps.
+    This avoids comparing Python date objects with datetime64 columns after Streamlit reruns.
+    """
+    h = history.copy()
+    if "Date" not in h.columns:
+        return h
+    h["Date"] = pd.to_datetime(h["Date"], errors="coerce").dt.normalize()
+    h = h[h["Date"].notna()].copy()
+    end = pd.Timestamp(report_date).normalize()
+    monday = end - pd.Timedelta(days=end.weekday())
+    return h[(h["Date"] >= monday) & (h["Date"] <= end) & (h["Date"].dt.weekday < 5)].copy()
+
+
 def wtd_pdf(history, report_date):
     monday=report_date-timedelta(days=report_date.weekday())
-    h=history[(history.Date>=monday)&(history.Date<=report_date)].copy()
-    h=h[pd.to_datetime(h.Date).dt.weekday<5]
+    h=filter_wtd(history, report_date)
     b=io.BytesIO(); styles=getSampleStyleSheet(); h2=ParagraphStyle("h2w",parent=styles["Heading2"],fontSize=15,spaceBefore=8,spaceAfter=7)
     doc=SimpleDocTemplate(b,pagesize=landscape(letter),leftMargin=22,rightMargin=22,topMargin=22,bottomMargin=22)
     story=[Paragraph("Week-to-Date Out-of-Stock Analysis",styles["Title"]),Paragraph(f"Monday {monday:%m/%d/%Y} through {report_date:%m/%d/%Y} (Monday-Friday workweek)",ParagraphStyle("subw",parent=styles["BodyText"],alignment=TA_CENTER)),Spacer(1,12)]
@@ -287,8 +300,7 @@ def wtd_pdf(history, report_date):
 def excel_export(report_date, data, df, history):
     """Create one polished Excel workbook containing the daily audit and Monday-Friday WTD analysis."""
     monday = report_date - timedelta(days=report_date.weekday())
-    h = history[(history.Date >= monday) & (history.Date <= report_date)].copy()
-    h = h[pd.to_datetime(h.Date).dt.weekday < 5]
+    h = filter_wtd(history, report_date)
 
     total_ordered = sum(int(o.get("total_ordered", 0) or 0) for o in data.get("orders", []))
     os_units = int(df.Qty.sum()) if len(df) else 0
@@ -522,7 +534,7 @@ if "data" in st.session_state:
     else:
         st.session_state.wtd_history = combine_history(None, pd.concat([st.session_state.wtd_history, today_hist], ignore_index=True))
     history=st.session_state.wtd_history.copy()
-    monday=rd-timedelta(days=rd.weekday()); wtd=history[(history.Date>=monday)&(history.Date<=rd)].copy(); wtd=wtd[pd.to_datetime(wtd.Date).dt.weekday<5]
+    monday=rd-timedelta(days=rd.weekday()); wtd=filter_wtd(history, rd)
     st.subheader("Download Reports")
     st.download_button("⬇️ OOS ANALYSIS PDF",analysis_pdf(data,df),f"OOS_Analysis_{rd}.pdf","application/pdf")
     st.download_button("⬇️ FALSE OOS — REPICK LIST",repick_pdf(df),f"False_OOS_Repick_{rd}.pdf","application/pdf")

@@ -1,4 +1,4 @@
-import os, io, re, json, tempfile, base64
+import os, io, re, json, tempfile, base64, hashlib, urllib.request, urllib.error
 from datetime import date, timedelta
 from difflib import SequenceMatcher
 import streamlit as st
@@ -12,6 +12,10 @@ from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.units import inch
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 
 st.set_page_config(page_title="OOS Auditor", page_icon="📦", layout="centered")
 
@@ -61,13 +65,27 @@ def upload_for_model(client, uploaded):
         except: pass
 
 
+def _optimized_image_bytes(raw, max_side=1800, quality=82):
+    """Shrink large phone photos before API upload. Keeps enough detail for pick-sheet handwriting."""
+    if Image is None:
+        return raw, "image/jpeg"
+    try:
+        im = Image.open(io.BytesIO(raw))
+        im = im.convert("RGB")
+        if max(im.size) > max_side:
+            scale = max_side / max(im.size)
+            im = im.resize((max(1, int(im.width*scale)), max(1, int(im.height*scale))))
+        out = io.BytesIO(); im.save(out, format="JPEG", quality=quality, optimize=True)
+        return out.getvalue(), "image/jpeg"
+    except Exception:
+        return raw, "image/jpeg"
+
 def model_attachment(uploaded, client):
     """Images go to Responses as input_image; PDFs/docs use Files + input_file."""
     name = uploaded.name.lower()
     raw = uploaded.getvalue()
     if name.endswith((".png", ".jpg", ".jpeg", ".webp")):
-        ext = name.rsplit(".", 1)[-1]
-        mime = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
+        raw, mime = _optimized_image_bytes(raw)
         b64 = base64.b64encode(raw).decode("ascii")
         return {"type":"input_image", "image_url":f"data:{mime};base64,{b64}", "detail":"high"}
     fid = upload_for_model(client, uploaded)
@@ -107,6 +125,26 @@ Use the ordered quantity for each OS line, not a handwritten filled quantity. If
     r = client.responses.create(model=model, input=[{"role":"user","content":content}])
     return parse_json(r.output_text)
 
+
+def _upload_fingerprint(files):
+    if not isinstance(files, (list, tuple)): files=[files]
+    h=hashlib.sha256()
+    for f in files:
+        h.update(str(f.name).encode()); h.update(f.getvalue())
+    return h.hexdigest()
+
+
+def cached_verified_outs(uploaded, client, model):
+    key=("verified", model, _upload_fingerprint(uploaded))
+    cache=st.session_state.setdefault("ai_result_cache", {})
+    if key not in cache: cache[key]=verified_outs(uploaded, client, model)
+    return cache[key]
+
+def cached_pick_data(uploaded_files, client, model):
+    key=("pick", model, _upload_fingerprint(uploaded_files))
+    cache=st.session_state.setdefault("ai_result_cache", {})
+    if key not in cache: cache[key]=pick_data(uploaded_files, client, model)
+    return cache[key]
 
 def classify(data, verified, threshold):
     rows = []
@@ -291,17 +329,69 @@ def repick_pdf(df):
     doc.build(story); return b.getvalue()
 
 
+def _secret(name, default=""):
+    try: return str(st.secrets.get(name, default) or default)
+    except Exception: return default
+
+def _github_history_config():
+    return (_secret("WTD_GITHUB_TOKEN"), _secret("WTD_GITHUB_REPO"), _secret("WTD_GITHUB_BRANCH","main"), _secret("WTD_GITHUB_PATH","data/oos_wtd_history.csv"))
+
+def _github_request(url, token, method="GET", payload=None):
+    headers={"Authorization":f"Bearer {token}","Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28","User-Agent":"OOS-Mobile-Auditor"}
+    data=json.dumps(payload).encode() if payload is not None else None
+    req=urllib.request.Request(url,data=data,headers=headers,method=method)
+    with urllib.request.urlopen(req,timeout=20) as resp:
+        return json.loads(resp.read().decode() or "{}")
+
+def load_persistent_history():
+    """Load centralized WTD history from a PRIVATE GitHub data repo when configured."""
+    token, repo, branch, path=_github_history_config()
+    if not token or not repo: return pd.DataFrame(), False
+    url=f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    try:
+        obj=_github_request(url,token)
+        raw=base64.b64decode(obj.get("content","").replace("\\n",""))
+        return pd.read_csv(io.BytesIO(raw)), True
+    except urllib.error.HTTPError as e:
+        if e.code==404: return pd.DataFrame(), True
+        raise
+
+def save_persistent_history(history):
+    token, repo, branch, path=_github_history_config()
+    if not token or not repo: return False
+    url=f"https://api.github.com/repos/{repo}/contents/{path}"
+    sha=None
+    try: sha=_github_request(url+f"?ref={branch}",token).get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code!=404: raise
+    csv_bytes=history.to_csv(index=False).encode()
+    payload={"message":"Update OOS WTD history","content":base64.b64encode(csv_bytes).decode(),"branch":branch}
+    if sha: payload["sha"]=sha
+    _github_request(url,token,"PUT",payload)
+    return True
+
+def merge_replace_day(history, today_df, report_date):
+    """Replace an existing route date instead of double-counting a rerun."""
+    parts=[]
+    if history is not None and len(history):
+        h=history.copy(); h["Date"]=pd.to_datetime(h["Date"],errors="coerce").dt.date
+        h=h[h["Date"] != report_date]
+        parts.append(h)
+    t=today_df.copy(); t["Date"]=report_date; parts.append(t)
+    return pd.concat(parts,ignore_index=True) if parts else t
+
 def current_history(report_date, data, df):
     ordered_map={str(o.get("account","Unknown")):int(o.get("total_ordered",0) or 0) for o in data.get("orders",[])}
+    unique_map={str(o.get("account","Unknown")):len(set(norm(x) for x in o.get("all_products",[]) if str(x).strip())) for o in data.get("orders",[])}
     rows=[]
     if len(df):
         for r in df.itertuples(index=False):
-            rows.append({"Date":str(report_date),"Account":r.Account,"Picker":r.Picker,"Product":r.Product,"Qty":int(r.Qty),"Status":r.Status,"OrderedUnits":ordered_map.get(str(r.Account),0)})
-    # Preserve locations with zero OOS so WTD ordered-unit totals stay correct.
+            rows.append({"Date":str(report_date),"Account":r.Account,"Picker":r.Picker,"Product":r.Product,"Qty":int(r.Qty),"Status":r.Status,"OrderedUnits":ordered_map.get(str(r.Account),0),"UniqueProducts":unique_map.get(str(r.Account),0)})
+    # Preserve locations with zero OOS so WTD ordered-unit and product-availability totals stay correct.
     present=set(df.Account.astype(str)) if len(df) else set()
     for account,ordered in ordered_map.items():
         if account not in present:
-            rows.append({"Date":str(report_date),"Account":account,"Picker":"","Product":"","Qty":0,"Status":"NO OOS","OrderedUnits":ordered})
+            rows.append({"Date":str(report_date),"Account":account,"Picker":"","Product":"","Qty":0,"Status":"NO OOS","OrderedUnits":ordered,"UniqueProducts":unique_map.get(account,0)})
     return pd.DataFrame(rows)
 
 
@@ -333,33 +423,55 @@ def filter_wtd(history, report_date):
 
 
 def wtd_pdf(history, report_date):
+    """WTD PDF: page 1 mirrors the normal OOS executive report; later pages retain weekly detail."""
     monday=report_date-timedelta(days=report_date.weekday())
     h=filter_wtd(history, report_date)
-    b=io.BytesIO(); styles=getSampleStyleSheet(); h2=ParagraphStyle("h2w",parent=styles["Heading2"],fontSize=15,spaceBefore=8,spaceAfter=7)
-    doc=SimpleDocTemplate(b,pagesize=landscape(letter),leftMargin=22,rightMargin=22,topMargin=22,bottomMargin=22)
-    story=[Paragraph("Week-to-Date Out-of-Stock Analysis",styles["Title"]),Paragraph(f"Monday {monday:%m/%d/%Y} through {report_date:%m/%d/%Y} (Monday-Friday workweek)",ParagraphStyle("subw",parent=styles["BodyText"],alignment=TA_CENTER)),Spacer(1,12)]
-    # OrderedUnits repeats for every OOS row; count once per Date+Account.
+    b=io.BytesIO(); doc=SimpleDocTemplate(b,pagesize=landscape(letter),rightMargin=18,leftMargin=18,topMargin=16,bottomMargin=16)
+    styles=getSampleStyleSheet(); title=ParagraphStyle("wt",parent=styles["Title"],fontSize=20,leading=22,alignment=TA_CENTER,spaceAfter=2)
+    sub=ParagraphStyle("ws",parent=styles["BodyText"],fontSize=9,leading=11,alignment=TA_CENTER,spaceAfter=7)
+    h2=ParagraphStyle("wh",parent=styles["Heading2"],fontSize=13,leading=15,spaceBefore=5,spaceAfter=5)
+    story=[Paragraph("Week-to-Date Out-of-Stock Analysis",title),Paragraph(f"Report Date Range: {monday:%B %d, %Y} – {report_date:%B %d, %Y} (Monday–Friday)",sub)]
     ord_units=int(h[["Date","Account","OrderedUnits"]].drop_duplicates(["Date","Account"])["OrderedUnits"].sum()) if len(h) else 0
     os_h=h[(h.Product.fillna("").astype(str).str.strip()!="") & (h.Status!="NO OOS")]
     os_units=int(os_h.Qty.sum()) if len(os_h) else 0
     false_h=os_h[os_h.Status=="FALSE OOS / PICKING EXCEPTION"]
-    summary_kpis(story,ord_units,os_units,int(false_h.Qty.sum()) if len(false_h) else 0,len(false_h))
-    story.append(Paragraph("1. Week-to-Date OOS by Location",h2))
+    # Product KPIs use distinct location/product pairs across the selected week.
+    hp=h[h.Product.fillna("").astype(str).str.strip()!=""].copy() if len(h) else h.copy()
+    unique_products=int(hp.Product.nunique()) if len(hp) else 0
+    unique_oos=int(os_h.Product.nunique()) if len(os_h) else 0
+    instock=(unique_products-unique_oos)/unique_products if unique_products else 0
+    product_oos=unique_oos/unique_products if unique_products else 0
+    k1=Table([["TOTAL UNITS ORDERED","OOS UNITS","OOS %","FALSE OOS UNITS"],[f"{ord_units:,}",f"{os_units:,}",f"{(os_units/ord_units*100 if ord_units else 0):.2f}%",f"{int(false_h.Qty.sum()) if len(false_h) else 0:,}"]],colWidths=[2.35*inch]*4)
+    k1.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),DARK),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTNAME",(0,0),(-1,-1),"Helvetica-Bold"),("ALIGN",(0,0),(-1,-1),"CENTER"),("FONTSIZE",(0,0),(-1,0),8),("FONTSIZE",(0,1),(-1,1),15),("GRID",(0,0),(-1,-1),.4,colors.grey),("TOPPADDING",(0,0),(-1,-1),6),("BOTTOMPADDING",(0,0),(-1,-1),6)])); story += [k1,Spacer(1,5)]
+    k2=Table([["UNIQUE PRODUCTS","UNIQUE PRODUCTS OOS","PRODUCT IN-STOCK %","PRODUCT OOS %"],[f"{unique_products:,}",f"{unique_oos:,}",f"{instock*100:.2f}%",f"{product_oos*100:.2f}%"]],colWidths=[2.35*inch]*4)
+    k2.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),DARK),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTNAME",(0,0),(-1,-1),"Helvetica-Bold"),("ALIGN",(0,0),(-1,-1),"CENTER"),("FONTSIZE",(0,0),(-1,0),8),("FONTSIZE",(0,1),(-1,1),15),("GRID",(0,0),(-1,-1),.4,colors.grey),("TOPPADDING",(0,0),(-1,-1),6),("BOTTOMPADDING",(0,0),(-1,-1),6)])); story += [k2,Spacer(1,6)]
+    # Availability by location. History has OS product rows; unique product totals are stored per location/day below.
+    story.append(Paragraph("Product Availability by Location",h2))
+    avail=[]
+    for account,g in h.groupby("Account") if len(h) else []:
+        # Sum daily unique-product counts if present; for WTD we use max product assortment seen at that location during week.
+        up=int(pd.to_numeric(g.get("UniqueProducts",pd.Series([0])),errors="coerce").fillna(0).max())
+        go=os_h[os_h.Account==account] if len(os_h) else os_h
+        uo=int(go.Product.nunique()) if len(go) else 0
+        avail.append([account,up,uo,f"{((up-uo)/up*100 if up else 0):.2f}%",f"{(uo/up*100 if up else 0):.2f}%"])
+    avail.sort(key=lambda r:float(r[4][:-1]),reverse=True)
+    add_table(story,["Location","Unique Products","Unique OOS","In-Stock %","OOS %"],avail,[3.7*inch,1.4*inch,1.2*inch,1.2*inch,1.0*inch],7.5)
+    story += [Spacer(1,5),Paragraph("Out-of-Stock Percentage by Location",h2)]
     locrows=[]
-    for account,g in h.groupby("Account"):
+    for account,g in h.groupby("Account") if len(h) else []:
         ordered=int(g[["Date","Account","OrderedUnits"]].drop_duplicates(["Date","Account"])["OrderedUnits"].sum())
-        og=g[(g.Product.fillna("").astype(str).str.strip()!="") & (g.Status!="NO OOS")]
-        oq=int(og.Qty.sum())
+        og=os_h[os_h.Account==account] if len(os_h) else os_h; oq=int(og.Qty.sum()) if len(og) else 0
         locrows.append([account,ordered,oq,f"{(oq/ordered*100 if ordered else 0):.2f}%"])
     locrows.sort(key=lambda r:float(r[3][:-1]),reverse=True); locrows.append(["TOTAL",ord_units,os_units,f"{(os_units/ord_units*100 if ord_units else 0):.2f}%"])
-    add_table(story,["Location","WTD Units Ordered","WTD OOS Units","WTD OOS %"],locrows,[3.5*inch,1.55*inch,1.55*inch,1.0*inch])
-    story += [Spacer(1,16),Paragraph("2. Week-to-Date OOS by Individual Item Quantity",h2)]
+    add_table(story,["Location","Total Units Ordered","Units on OOS Lines","OOS %"],locrows,[4.0*inch,1.8*inch,1.8*inch,1.2*inch],7.5)
+    # Existing weekly detail begins page 2.
+    story += [PageBreak(),Paragraph("Week-to-Date Item Detail",title),Paragraph(f"{monday:%m/%d/%Y} through {report_date:%m/%d/%Y}",sub),Paragraph("1. OOS by Individual Item Quantity",h2)]
     if len(os_h):
         q=os_h.groupby("Product").agg(OS_Units=("Qty","sum"),Locations=("Account","nunique")).reset_index().sort_values("OS_Units",ascending=False)
         qr=[[i,r.Product,int(r.OS_Units),int(r.Locations),f"{(r.OS_Units/os_units*100 if os_units else 0):.1f}%"] for i,r in enumerate(q.itertuples(index=False),1)]; qr.append(["","TOTAL",os_units,"","100.0%"])
     else: qr=[["","No OOS items",0,0,"0.0%"]]
     add_table(story,["Rank","Product","WTD OOS Units","Locations OOS","% of WTD OOS"],qr,[.55*inch,4.4*inch,1.0*inch,1.0*inch,1.0*inch],7.5)
-    story += [Spacer(1,16),Paragraph("3. Week-to-Date OOS by Item Frequency / Occurrences",h2)]
+    story += [Spacer(1,16),Paragraph("2. OOS by Item Frequency / Occurrences",h2)]
     if len(os_h):
         f=os_h.groupby("Product").agg(Occurrences=("Product","size"),Locations=("Account","nunique"),OS_Units=("Qty","sum")).reset_index().sort_values(["Occurrences","OS_Units"],ascending=False)
         fr=[[i,r.Product,int(r.Occurrences),int(r.Locations),int(r.OS_Units)] for i,r in enumerate(f.itertuples(index=False),1)]; fr.append(["","TOTAL",len(os_h),"",os_units])
@@ -577,8 +689,8 @@ if st.button("RUN AUDIT",type="primary",disabled=not(pick and verified_file and 
     client=OpenAI(api_key=api_key)
     try:
         with st.status("Reading audit...",expanded=True) as s:
-            st.write("Reading Verified Outs — Column A only..."); vo=verified_outs(verified_file,client,model); st.write(f"{len(vo)} verified OOS items found.")
-            st.write(f"Reading {len(pick)} pick-sheet file(s)/photo(s) and handwritten OS marks..."); data=pick_data(pick,client,model)
+            st.write("Reading Verified Outs — Column A only..."); vo=cached_verified_outs(verified_file,client,model); st.write(f"{len(vo)} verified OOS items found.")
+            st.write(f"Reading {len(pick)} pick-sheet file(s)/photo(s) and handwritten OS marks..."); data=cached_pick_data(pick,client,model)
             route_rd = _route_date(data, report_date)
             st.session_state.update({"data":data,"vo":vo,"report_date":route_rd}); s.update(label="Audit ready",state="complete")
     except Exception as e:
@@ -600,12 +712,21 @@ if "data" in st.session_state:
     with tab3: st.dataframe(pd.DataFrame({"Verified OOS — Column A":vo}),use_container_width=True,hide_index=True)
 
     today_hist=current_history(rd,data,df)
-    # Keep WTD data in the current Streamlit session without showing a separate history area.
-    if "wtd_history" not in st.session_state:
-        st.session_state.wtd_history = today_hist.copy()
-    else:
-        st.session_state.wtd_history = combine_history(None, pd.concat([st.session_state.wtd_history, today_hist], ignore_index=True))
-    history=st.session_state.wtd_history.copy()
+    # Centralized WTD storage when a private GitHub data repo is configured.
+    # Re-running the same route date REPLACES that date so it is never double-counted.
+    try:
+        persisted, persistent_enabled = load_persistent_history()
+        base_hist = persisted if persistent_enabled else st.session_state.get("wtd_history", pd.DataFrame())
+        history = merge_replace_day(base_hist, today_hist, rd)
+        if persistent_enabled:
+            save_persistent_history(history)
+        st.session_state.wtd_history = history.copy()
+        st.session_state.wtd_storage_mode = "persistent" if persistent_enabled else "session"
+    except Exception as e:
+        base_hist=st.session_state.get("wtd_history", pd.DataFrame())
+        history=merge_replace_day(base_hist,today_hist,rd); st.session_state.wtd_history=history.copy()
+        st.session_state.wtd_storage_mode="session"
+        st.warning(f"WTD permanent storage is temporarily unavailable; this audit is retained for this session. {type(e).__name__}")
     monday=rd-timedelta(days=rd.weekday()); wtd=filter_wtd(history, rd)
     st.subheader("Download Reports")
     st.download_button("⬇️ OOS ANALYSIS — ONE-PAGE REPORT",analysis_pdf(data,df,rd),f"OOS_Analysis_{rd}.pdf","application/pdf")
@@ -613,3 +734,5 @@ if "data" in st.session_state:
     st.download_button("⬇️ WEEK-TO-DATE OOS PDF",wtd_pdf(history,rd),f"OOS_WTD_{monday}_to_{rd}.pdf","application/pdf")
     st.download_button("⬇️ COMPLETE EXCEL WORKBOOK",excel_export(rd,data,df,history),f"OOS_Audit_{rd}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",help="One workbook containing daily summaries, item quantity/frequency, false OOS repick, detailed audit data and WTD analysis.")
     st.caption(f"WTD window: {monday:%A %m/%d} through {rd:%A %m/%d}. Saturday/Sunday records are excluded.")
+    if st.session_state.get("wtd_storage_mode")=="persistent": st.caption("✅ WTD data saved centrally. Re-running the same route date replaces that day instead of duplicating it.")
+    else: st.caption("ℹ️ WTD is currently session-only. Configure private persistent storage secrets to retain data across Streamlit restarts and for all team members.")

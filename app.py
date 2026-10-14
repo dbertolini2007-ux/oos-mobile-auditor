@@ -1,4 +1,4 @@
-import os, io, re, json, tempfile
+import os, io, re, json, tempfile, base64, mimetypes
 from datetime import date, timedelta
 from difflib import SequenceMatcher
 import streamlit as st
@@ -62,18 +62,48 @@ def upload_for_model(client, uploaded):
 
 
 def verified_outs(uploaded, client, model):
+    # Excel/CSV never need the AI API. Read Column A directly.
     n = uploaded.name.lower()
+    raw = uploaded.getvalue()
     if n.endswith((".xlsx", ".xls")):
-        df = pd.read_excel(io.BytesIO(uploaded.getvalue()), header=None)
+        df = pd.read_excel(io.BytesIO(raw), header=None)
         return [str(v).strip() for v in df.iloc[:, 0].dropna() if str(v).strip()]
     if n.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(uploaded.getvalue()), header=None)
+        df = pd.read_csv(io.BytesIO(raw), header=None)
         return [str(v).strip() for v in df.iloc[:, 0].dropna() if str(v).strip()]
-    fid = upload_for_model(client, uploaded)
-    r = client.responses.create(model=model, input=[{"role":"user","content":[
-        {"type":"input_file","file_id":fid},
-        {"type":"input_text","text":'Read this Verified Outs sheet. Anything in the LEFT COLUMN / Column A is a verified OOS item. Ignore Column B and all other columns. Return JSON only: {"verified_outs":["item 1","item 2"]}'}]}])
-    return parse_json(r.output_text).get("verified_outs", [])
+
+    instruction = (
+        'Read this Verified Outs sheet. Anything in the LEFT COLUMN / Column A is a verified OOS item. '
+        'Ignore Column B and every other column, including notes/status. Return JSON only in exactly this shape: '
+        '{"verified_outs":["item 1","item 2"]}'
+    )
+
+    # Images must be sent as image input, not as a generic input_file.
+    if n.endswith((".png", ".jpg", ".jpeg")):
+        mime = "image/png" if n.endswith(".png") else "image/jpeg"
+        data_url = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+        r = client.responses.create(
+            model=model,
+            input=[{"role":"user","content":[
+                {"type":"input_image","image_url":data_url},
+                {"type":"input_text","text":instruction}
+            ]}]
+        )
+    elif n.endswith(".pdf"):
+        # PDFs use the Files API + input_file.
+        fid = upload_for_model(client, uploaded)
+        r = client.responses.create(
+            model=model,
+            input=[{"role":"user","content":[
+                {"type":"input_file","file_id":fid},
+                {"type":"input_text","text":instruction}
+            ]}]
+        )
+    else:
+        raise ValueError("Unsupported Verified Outs file type. Use XLSX, XLS, CSV, PDF, PNG, JPG, or JPEG.")
+
+    parsed = parse_json(r.output_text)
+    return [str(v).strip() for v in parsed.get("verified_outs", []) if str(v).strip()]
 
 
 def pick_data(uploaded, client, model):
@@ -431,8 +461,21 @@ if not api_key: st.error("Server setup required: OPENAI_API_KEY has not been con
 if st.button("RUN AUDIT",type="primary",disabled=not(pick and verified_file and api_key)):
     client=OpenAI(api_key=api_key)
     with st.status("Reading audit...",expanded=True) as s:
-        st.write("Reading Verified Outs — Column A only..."); vo=verified_outs(verified_file,client,model); st.write(f"{len(vo)} verified OOS items found.")
-        st.write("Reading pick sheets and handwritten OS marks..."); data=pick_data(pick,client,model)
+        st.write("Reading Verified Outs — Column A only...")
+        try:
+            vo=verified_outs(verified_file,client,model)
+        except Exception as e:
+            s.update(label="Verified Outs could not be read",state="error")
+            st.error(f"Verified Outs error: {e}")
+            st.stop()
+        st.write(f"{len(vo)} verified OOS items found.")
+        st.write("Reading pick sheets and handwritten OS marks...")
+        try:
+            data=pick_data(pick,client,model)
+        except Exception as e:
+            s.update(label="Pick sheets could not be read",state="error")
+            st.error(f"Pick sheet error: {e}")
+            st.stop()
         st.session_state.update({"data":data,"vo":vo,"report_date":report_date}); s.update(label="Audit ready",state="complete")
 
 if "data" in st.session_state:

@@ -92,14 +92,15 @@ def pick_data(uploaded_files, client, model):
     # Accept one PDF, one photo, or multiple photos/PDFs from a phone camera/gallery.
     if not isinstance(uploaded_files, (list, tuple)):
         uploaded_files = [uploaded_files]
-    content = []
-    for uploaded in uploaded_files:
-        content.append(model_attachment(uploaded, client))
-    prompt = """Read all attached vending/micro-market pick sheets carefully. Attachments may be PDFs or phone photos, and multiple photos may be consecutive pages of the same pick list. Treat all attachments as one audit batch and consolidate pages belonging to the same order/account.
+    content = [model_attachment(uploaded, client) for uploaded in uploaded_files]
+    prompt = """Read all attached vending/micro-market route/pick sheets carefully. Attachments may be PDFs or phone photos, and multiple photos may be consecutive pages of the same pick list. Treat all attachments as one audit batch and consolidate pages belonging to the same order/account.
+Extract the ROUTE DATE / PICK-SHEET DATE printed on the sheets. Do not use today's date. If the same route date appears on the batch, return it once as route_date in YYYY-MM-DD format. If dates conflict, use the date printed on the majority of the route sheets and lower date_confidence.
 Only lines explicitly marked OS count as out of stock. Checkmarks, blanks, partial fills, quantities written for fills, and other notes are not OS.
 Do not double-count cumulative printed totals on continuation pages.
+Also return every distinct product/SKU printed on each location's pick sheet in all_products. This is required to calculate product availability, even when the product is not marked OS.
 Return JSON only:
-{"orders":[{"account":"name","picker":"name if visible","pages":[1],"total_ordered":123,
+{"route_date":"YYYY-MM-DD","date_confidence":0.98,"orders":[{"account":"name","picker":"name if visible","pages":[1],"total_ordered":123,
+"all_products":["product 1","product 2"],
 "os_lines":[{"product":"full product name","ordered_qty":5,"page":1,"confidence":0.98}]}]}
 Use the ordered quantity for each OS line, not a handwritten filled quantity. If handwriting or product text is uncertain, lower confidence rather than guessing."""
     content.append({"type":"input_text","text":prompt})
@@ -157,45 +158,115 @@ def summary_kpis(story, total_ordered, os_units, false_units, false_lines):
     story += [t, Spacer(1,14)]
 
 
-def analysis_pdf(data, df, title="Out-of-Stock Analysis", subtitle="Only pick-sheet lines explicitly marked OS are counted."):
+def _route_date(data, fallback):
+    raw = str(data.get("route_date", "") or "").strip()
+    try:
+        return pd.to_datetime(raw, errors="raise").date()
+    except Exception:
+        return fallback
+
+
+def _product_key(x):
+    return norm(x)
+
+
+def analysis_pdf(data, df, report_date=None):
+    """One-page executive OOS report matching the approved example layout."""
     b = io.BytesIO(); styles = getSampleStyleSheet()
-    h2 = ParagraphStyle("h2x", parent=styles["Heading2"], fontSize=15, leading=18, spaceBefore=8, spaceAfter=7)
-    doc = SimpleDocTemplate(b, pagesize=landscape(letter), leftMargin=22, rightMargin=22, topMargin=22, bottomMargin=22)
-    story = [Paragraph(title, styles["Title"]), Paragraph(subtitle, ParagraphStyle("sub",parent=styles["BodyText"],alignment=TA_CENTER)), Spacer(1,12)]
-    total_ordered = sum(int(o.get("total_ordered",0) or 0) for o in data.get("orders",[]))
+    route_date = _route_date(data, report_date or date.today())
+    title_style = ParagraphStyle("report_title", parent=styles["Title"], fontSize=20, leading=22, alignment=TA_CENTER, spaceAfter=2)
+    date_style = ParagraphStyle("route_date", parent=styles["BodyText"], fontSize=10, leading=12, alignment=TA_CENTER, textColor=DARK, spaceAfter=1)
+    sub_style = ParagraphStyle("report_sub", parent=styles["BodyText"], fontSize=8, leading=10, textColor=colors.HexColor("#555555"), alignment=TA_CENTER, spaceAfter=6)
+    h2 = ParagraphStyle("h2exec", parent=styles["Heading2"], fontSize=12.5, leading=14, textColor=DARK, spaceBefore=5, spaceAfter=4)
+    doc = SimpleDocTemplate(b, pagesize=letter, leftMargin=28, rightMargin=28, topMargin=18, bottomMargin=18)
+    story = [Paragraph("Out-of-Stock Analysis", title_style),
+             Paragraph(f"Route Date: {route_date:%B %d, %Y}", date_style),
+             Paragraph("Only pick-sheet lines explicitly marked OS are counted.", sub_style)]
+
+    # Consolidate continuation pages/order blocks by location.
+    loc_map = {}
+    overall_products = {}
+    for o in data.get("orders", []):
+        account = str(o.get("account", "Unknown") or "Unknown").strip()
+        ordered = int(o.get("total_ordered", 0) or 0)
+        os_lines = o.get("os_lines", []) or []
+        all_products = o.get("all_products", []) or []
+        rec = loc_map.setdefault(account, {"ordered":0, "os_units":0, "products":{}, "oos_products":{}})
+        rec["ordered"] += ordered
+        rec["os_units"] += sum(int(x.get("ordered_qty", 0) or 0) for x in os_lines)
+        for prod in all_products:
+            k = _product_key(prod)
+            if k:
+                rec["products"][k] = str(prod)
+                overall_products[k] = str(prod)
+        for x in os_lines:
+            prod = str(x.get("product", "") or "").strip(); k = _product_key(prod)
+            if k:
+                rec["oos_products"][k] = prod
+                # Older extraction results may not contain all_products; keep OOS products represented.
+                rec["products"].setdefault(k, prod)
+                overall_products.setdefault(k, prod)
+
+    total_ordered = sum(v["ordered"] for v in loc_map.values())
     os_units = int(df.Qty.sum()) if len(df) else 0
-    false_df = df[df.Status=="FALSE OOS / PICKING EXCEPTION"] if len(df) else df
+    false_df = df[df.Status == "FALSE OOS / PICKING EXCEPTION"] if len(df) else df
     false_units = int(false_df.Qty.sum()) if len(false_df) else 0
-    summary_kpis(story,total_ordered,os_units,false_units,len(false_df))
+    unique_products = len(overall_products)
+    overall_oos_products = {_product_key(p) for p in (df.Product.tolist() if len(df) else []) if _product_key(p)}
+    unique_oos = len(overall_oos_products)
+    in_stock_pct = ((unique_products - unique_oos) / unique_products * 100) if unique_products else 0
+    prod_oos_pct = (unique_oos / unique_products * 100) if unique_products else 0
 
-    story.append(Paragraph("1. Out-of-Stock Percentage by Location", h2))
+    def kpi_table(headers, vals):
+        t=Table([headers, vals], colWidths=[1.79*inch]*4, rowHeights=[.29*inch,.34*inch])
+        t.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0),DARK),("TEXTCOLOR",(0,0),(-1,0),colors.white),
+            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,0),7.2),
+            ("ALIGN",(0,0),(-1,-1),"CENTER"),("FONTNAME",(0,1),(-1,1),"Helvetica-Bold"),
+            ("FONTSIZE",(0,1),(-1,1),12.5),("BOX",(0,0),(-1,-1),.4,colors.grey),
+            ("INNERGRID",(0,0),(-1,-1),.25,colors.grey),("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+        story.append(t); story.append(Spacer(1,4))
+
+    unit_pct = os_units/total_ordered*100 if total_ordered else 0
+    kpi_table(["TOTAL UNITS ORDERED","OOS UNITS","OOS %","FALSE OOS UNITS"],
+              [f"{total_ordered:,}",f"{os_units:,}",f"{unit_pct:.2f}%",f"{false_units:,}"])
+    kpi_table(["UNIQUE PRODUCTS","UNIQUE PRODUCTS OOS","PRODUCT IN-STOCK %","PRODUCT OOS %"],
+              [f"{unique_products:,}",f"{unique_oos:,}",f"{in_stock_pct:.2f}%",f"{prod_oos_pct:.2f}%"])
+
+    story.append(Paragraph("Product Availability by Location", h2))
+    avail=[]
+    for account,v in loc_map.items():
+        up=len(v["products"]); uo=len(v["oos_products"])
+        inst=((up-uo)/up*100) if up else 0; oop=(uo/up*100) if up else 0
+        avail.append([account, f"{up:,}", f"{uo:,}", f"{inst:.2f}%", f"{oop:.2f}%"])
+    avail.sort(key=lambda r: float(r[4].replace("%","")), reverse=True)
+    avail.append(["TOTAL", f"{unique_products:,}", f"{unique_oos:,}", f"{in_stock_pct:.2f}%", f"{prod_oos_pct:.2f}%"])
+    t=Table([["Location","Unique Products","Unique OOS","In-Stock %","OOS %"]]+avail,
+            colWidths=[3.05*inch,1.08*inch,.95*inch,.95*inch,.85*inch], repeatRows=1)
+    t.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),DARK),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+        ("FONTSIZE",(0,0),(-1,-1),6.8),("GRID",(0,0),(-1,-1),.3,colors.HexColor("#AAAAAA")),
+        ("ROWBACKGROUNDS",(0,1),(-1,-2),[colors.white,LIGHT]),("BACKGROUND",(0,-1),(-1,-1),MID),("FONTNAME",(0,-1),(-1,-1),"Helvetica-Bold"),
+        ("TOPPADDING",(0,0),(-1,-1),3.2),("BOTTOMPADDING",(0,0),(-1,-1),3.2),("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+    story.append(t)
+
+    story.append(Paragraph("Out-of-Stock Percentage by Location", h2))
     loc=[]
-    for o in data.get("orders",[]):
-        ordered=int(o.get("total_ordered",0) or 0); oq=sum(int(x.get("ordered_qty",0) or 0) for x in o.get("os_lines",[]))
-        loc.append([o.get("account","Unknown"),ordered,oq,f"{(oq/ordered*100 if ordered else 0):.2f}%"])
-    loc.sort(key=lambda r: float(r[3][:-1]), reverse=True)
-    loc.append(["TOTAL",total_ordered,os_units,f"{(os_units/total_ordered*100 if total_ordered else 0):.2f}%"])
-    add_table(story,["Location","Total Units Ordered","Units on OOS Lines","OOS %"],loc,[3.5*inch,1.55*inch,1.55*inch,1.0*inch])
-    story += [Spacer(1,16), Paragraph("2. OOS by Individual Item Quantity", h2)]
-
-    if len(df):
-        q = df.groupby("Product",dropna=False).agg(OS_Units=("Qty","sum"), Locations=("Account","nunique")).reset_index().sort_values(["OS_Units","Product"],ascending=[False,True])
-        qrows=[]
-        for i,r in enumerate(q.itertuples(index=False),1):
-            qrows.append([i,r.Product,int(r.OS_Units),int(r.Locations),f"{(r.OS_Units/os_units*100 if os_units else 0):.1f}%"])
-        qrows.append(["","TOTAL",os_units,"", "100.0%" if os_units else "0.0%"])
-    else: qrows=[["","No OOS items",0,0,"0.0%"]]
-    add_table(story,["Rank","Product","OOS Units","Locations OOS","% of OOS Units"],qrows,[.55*inch,4.4*inch,1.0*inch,1.0*inch,1.0*inch],7.5)
-
-    story += [Spacer(1,16), Paragraph("3. OOS by Item Frequency / Occurrences", h2)]
-    if len(df):
-        f = df.groupby("Product",dropna=False).agg(Occurrences=("Product","size"),Locations=("Account","nunique"),OS_Units=("Qty","sum")).reset_index().sort_values(["Occurrences","OS_Units"],ascending=[False,False])
-        frows=[[i,r.Product,int(r.Occurrences),int(r.Locations),int(r.OS_Units)] for i,r in enumerate(f.itertuples(index=False),1)]
-        frows.append(["","TOTAL",len(df),"",os_units])
-    else: frows=[["","No OOS items",0,0,0]]
-    add_table(story,["Rank","Product","OOS Occurrences","Locations OOS","OOS Units"],frows,[.55*inch,4.4*inch,1.1*inch,1.0*inch,1.0*inch],7.5)
-    doc.build(story); return b.getvalue()
-
+    for account,v in loc_map.items():
+        pct=v["os_units"]/v["ordered"]*100 if v["ordered"] else 0
+        loc.append([account,f"{v['ordered']:,}",f"{v['os_units']:,}",f"{pct:.2f}%"])
+    loc.sort(key=lambda r: float(r[3].replace("%","")), reverse=True)
+    loc.append(["TOTAL",f"{total_ordered:,}",f"{os_units:,}",f"{unit_pct:.2f}%"])
+    t2=Table([["Location","Total Units Ordered","Units on OOS Lines","OOS %"]]+loc,
+             colWidths=[3.25*inch,1.45*inch,1.45*inch,.85*inch], repeatRows=1)
+    t2.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),DARK),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+        ("FONTSIZE",(0,0),(-1,-1),6.8),("GRID",(0,0),(-1,-1),.3,colors.HexColor("#AAAAAA")),
+        ("ROWBACKGROUNDS",(0,1),(-1,-2),[colors.white,LIGHT]),("BACKGROUND",(0,-1),(-1,-1),MID),("FONTNAME",(0,-1),(-1,-1),"Helvetica-Bold"),
+        ("TOPPADDING",(0,0),(-1,-1),3.2),("BOTTOMPADDING",(0,0),(-1,-1),3.2),("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+    story.append(t2)
+    doc.build(story)
+    return b.getvalue()
 
 def repick_pdf(df):
     b=io.BytesIO(); styles=getSampleStyleSheet()
@@ -508,7 +579,8 @@ if st.button("RUN AUDIT",type="primary",disabled=not(pick and verified_file and 
         with st.status("Reading audit...",expanded=True) as s:
             st.write("Reading Verified Outs — Column A only..."); vo=verified_outs(verified_file,client,model); st.write(f"{len(vo)} verified OOS items found.")
             st.write(f"Reading {len(pick)} pick-sheet file(s)/photo(s) and handwritten OS marks..."); data=pick_data(pick,client,model)
-            st.session_state.update({"data":data,"vo":vo,"report_date":report_date}); s.update(label="Audit ready",state="complete")
+            route_rd = _route_date(data, report_date)
+            st.session_state.update({"data":data,"vo":vo,"report_date":route_rd}); s.update(label="Audit ready",state="complete")
     except Exception as e:
         st.error("The audit reader could not process one of the uploads. Try again, or use a clear JPG/PNG photo or PDF.")
         st.caption(f"Technical detail: {type(e).__name__}: {str(e)[:500]}")
@@ -536,7 +608,7 @@ if "data" in st.session_state:
     history=st.session_state.wtd_history.copy()
     monday=rd-timedelta(days=rd.weekday()); wtd=filter_wtd(history, rd)
     st.subheader("Download Reports")
-    st.download_button("⬇️ OOS ANALYSIS PDF",analysis_pdf(data,df),f"OOS_Analysis_{rd}.pdf","application/pdf")
+    st.download_button("⬇️ OOS ANALYSIS — ONE-PAGE REPORT",analysis_pdf(data,df,rd),f"OOS_Analysis_{rd}.pdf","application/pdf")
     st.download_button("⬇️ FALSE OOS — REPICK LIST",repick_pdf(df),f"False_OOS_Repick_{rd}.pdf","application/pdf")
     st.download_button("⬇️ WEEK-TO-DATE OOS PDF",wtd_pdf(history,rd),f"OOS_WTD_{monday}_to_{rd}.pdf","application/pdf")
     st.download_button("⬇️ COMPLETE EXCEL WORKBOOK",excel_export(rd,data,df,history),f"OOS_Audit_{rd}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",help="One workbook containing daily summaries, item quantity/frequency, false OOS repick, detailed audit data and WTD analysis.")

@@ -432,8 +432,17 @@ if "camera_pick_photos" not in st.session_state:
     st.session_state.camera_pick_photos = []
 
 st.markdown("### 1️⃣ Pick Sheets")
-photo_tab, file_tab = st.tabs(["📷 Take Picture", "🖼️ Select Pictures / Files"])
-with photo_tab:
+pick_source = st.radio(
+    "Choose how to add pick sheets",
+    ["🖼️ Select Pictures / Files", "📷 Take Picture"],
+    horizontal=True,
+    key="pick_source",
+)
+
+# IMPORTANT: The camera widget is created ONLY after the employee explicitly
+# selects Take Picture. This prevents the camera from opening automatically.
+selected_pick_files = []
+if pick_source == "📷 Take Picture":
     camera_photo = st.camera_input("Take a picture of a picklist page", key="pick_camera")
     if camera_photo is not None:
         if st.button("➕ ADD THIS PHOTO", use_container_width=True):
@@ -449,9 +458,14 @@ with photo_tab:
         if st.button("🗑️ CLEAR CAMERA PHOTOS", use_container_width=True):
             st.session_state.camera_pick_photos = []
             st.rerun()
-
-with file_tab:
-    selected_pick_files = st.file_uploader("Select existing pictures or PDF pick sheets",type=["pdf","png","jpg","jpeg","webp"],accept_multiple_files=True,help="Select one or multiple pictures/PDFs from the phone.",key="pick_file_upload")
+else:
+    selected_pick_files = st.file_uploader(
+        "Select existing pictures or PDF pick sheets",
+        type=["pdf","png","jpg","jpeg","webp"],
+        accept_multiple_files=True,
+        help="Select one or multiple pictures/PDFs from the phone.",
+        key="pick_file_upload",
+    )
 
 class MemoryUpload:
     def __init__(self, name, data):

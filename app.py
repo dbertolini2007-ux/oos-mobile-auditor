@@ -217,32 +217,72 @@ def summary_kpis(story, total_ordered, os_units, false_units, false_lines, total
 
 def analysis_pdf(data, df, title="Out-of-Stock Analysis", subtitle="Only pick-sheet lines explicitly marked OS are counted."):
     b = io.BytesIO(); styles = getSampleStyleSheet()
-    h2 = ParagraphStyle("h2x", parent=styles["Heading2"], fontSize=15, leading=18, spaceBefore=8, spaceAfter=7)
-    doc = SimpleDocTemplate(b, pagesize=landscape(letter), leftMargin=22, rightMargin=22, topMargin=22, bottomMargin=22)
-    story = [Paragraph(title, styles["Title"]), Paragraph(subtitle, ParagraphStyle("sub",parent=styles["BodyText"],alignment=TA_CENTER)), Spacer(1,12)]
+    h2 = ParagraphStyle("h2x", parent=styles["Heading2"], fontSize=12.5, leading=14, spaceBefore=5, spaceAfter=4)
+    # Portrait, intentionally compact so the complete daily report stays on one sheet.
+    doc = SimpleDocTemplate(b, pagesize=letter, leftMargin=20, rightMargin=20, topMargin=18, bottomMargin=18)
+    title_style = ParagraphStyle("ptitle", parent=styles["Title"], fontSize=19, leading=21, spaceAfter=2)
+    sub_style = ParagraphStyle("psub", parent=styles["BodyText"], alignment=TA_CENTER, fontSize=8.5, leading=10)
+    story = [Paragraph(title, title_style), Paragraph(subtitle, sub_style), Spacer(1,7)]
     total_ordered = sum(int(o.get("total_ordered",0) or 0) for o in data.get("orders",[]))
     os_units = int(df.Qty.sum()) if len(df) else 0
     false_df = df[df.Status=="FALSE OOS / PICKING EXCEPTION"] if len(df) else df
     false_units = int(false_df.Qty.sum()) if len(false_df) else 0
     prod_loc, total_unique, oos_unique = product_availability(data, df)
     prod_map = {r["Location"]: r for r in prod_loc}
-    summary_kpis(story,total_ordered,os_units,false_units,len(false_df),total_unique,oos_unique)
 
-    story.append(Paragraph("1. Out-of-Stock Percentage by Location", h2))
+    # Keep the existing overall unit KPI row.
+    pct = os_units / total_ordered * 100 if total_ordered else 0
+    k = [["TOTAL UNITS ORDERED","OOS UNITS","OOS %","FALSE OOS UNITS"],
+         [f"{total_ordered:,}",f"{os_units:,}",f"{pct:.2f}%",f"{false_units:,}"]]
+    t = Table(k, colWidths=[1.8*inch]*4, rowHeights=[.29*inch,.34*inch])
+    t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),DARK),("TEXTCOLOR",(0,0),(-1,0),colors.white),
+                           ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,0),7.5),
+                           ("ALIGN",(0,0),(-1,-1),"CENTER"),("FONTNAME",(0,1),(-1,1),"Helvetica-Bold"),
+                           ("FONTSIZE",(0,1),(-1,1),13),("BOX",(0,0),(-1,-1),.45,colors.grey),
+                           ("INNERGRID",(0,0),(-1,-1),.25,colors.grey),("TOPPADDING",(0,0),(-1,-1),3),
+                           ("BOTTOMPADDING",(0,0),(-1,-1),3)]))
+    story += [t, Spacer(1,4)]
+
+    # Keep the unique-product KPI row requested previously.
+    product_oos_pct = oos_unique / total_unique * 100 if total_unique else 0
+    product_in_pct = 100 - product_oos_pct if total_unique else 0
+    u = [["UNIQUE PRODUCTS","UNIQUE PRODUCTS OOS","PRODUCT IN-STOCK %","PRODUCT OOS %"],
+         [f"{total_unique:,}",f"{oos_unique:,}",f"{product_in_pct:.2f}%",f"{product_oos_pct:.2f}%"]]
+    ut = Table(u, colWidths=[1.8*inch]*4, rowHeights=[.29*inch,.34*inch])
+    ut.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),DARK),("TEXTCOLOR",(0,0),(-1,0),colors.white),
+                           ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,0),7.5),
+                           ("ALIGN",(0,0),(-1,-1),"CENTER"),("FONTNAME",(0,1),(-1,1),"Helvetica-Bold"),
+                           ("FONTSIZE",(0,1),(-1,1),13),("BOX",(0,0),(-1,-1),.45,colors.grey),
+                           ("INNERGRID",(0,0),(-1,-1),.25,colors.grey),("TOPPADDING",(0,0),(-1,-1),3),
+                           ("BOTTOMPADDING",(0,0),(-1,-1),3)]))
+    story += [ut, Spacer(1,6)]
+
+    # Existing unique-product availability by location, kept as its own table.
+    story.append(Paragraph("Product Availability by Location", h2))
+    prod_rows=[]
+    for o in data.get("orders",[]):
+        account=o.get("account","Unknown"); pm=prod_map.get(account,{})
+        up=int(pm.get("Unique Products",0)); uo=int(pm.get("Unique OOS Products",0))
+        prod_rows.append([account,up,uo,f"{(pm.get('Product In-Stock %',0)*100):.2f}%",f"{(pm.get('Product OOS %',0)*100):.2f}%"])
+    prod_rows.sort(key=lambda r: float(r[4][:-1]), reverse=True)
+    prod_rows.append(["TOTAL",total_unique,oos_unique,f"{product_in_pct:.2f}%",f"{product_oos_pct:.2f}%"])
+    add_table(story,["Location","Unique Products","Unique OOS","In-Stock %","OOS %"],prod_rows,
+              [2.65*inch,1.18*inch,1.05*inch,1.15*inch,1.05*inch],6.5)
+    story.append(Spacer(1,4))
+
+    # Add the original large unit-based location table from the user's example as a separate table underneath.
+    story.append(Paragraph("Out-of-Stock Percentage by Location", h2))
     loc=[]
     for o in data.get("orders",[]):
-        ordered=int(o.get("total_ordered",0) or 0); oq=sum(int(x.get("ordered_qty",0) or 0) for x in o.get("os_lines",[]))
+        ordered=int(o.get("total_ordered",0) or 0)
+        oq=sum(int(x.get("ordered_qty",0) or 0) for x in o.get("os_lines",[]))
         account=o.get("account","Unknown")
-        pm=prod_map.get(account,{})
-        up=int(pm.get("Unique Products",0)); uo=int(pm.get("Unique OOS Products",0))
-        loc.append([account,ordered,oq,f"{(oq/ordered*100 if ordered else 0):.2f}%",up,uo,
-                    f"{(pm.get('Product In-Stock %',0)*100):.2f}%",f"{(pm.get('Product OOS %',0)*100):.2f}%"])
+        loc.append([account,ordered,oq,f"{(oq/ordered*100 if ordered else 0):.2f}%"])
     loc.sort(key=lambda r: float(r[3][:-1]), reverse=True)
-    loc.append(["TOTAL",total_ordered,os_units,f"{(os_units/total_ordered*100 if total_ordered else 0):.2f}%",
-                total_unique,oos_unique,f"{((total_unique-oos_unique)/total_unique*100 if total_unique else 0):.2f}%",
-                f"{(oos_unique/total_unique*100 if total_unique else 0):.2f}%"])
-    add_table(story,["Location","Units Ordered","OOS Units","Unit OOS %","Unique Products","Unique OOS","Product In-Stock %","Product OOS %"],
-              loc,[2.15*inch,.85*inch,.75*inch,.72*inch,.82*inch,.72*inch,.95*inch,.82*inch],6.5)
+    loc.append(["TOTAL",total_ordered,os_units,f"{(os_units/total_ordered*100 if total_ordered else 0):.2f}%"])
+    add_table(story,["Location","Total Units Ordered","Units on OOS Lines","OOS %"],loc,
+              [3.25*inch,1.45*inch,1.45*inch,1.05*inch],6.5)
+
     doc.build(story); return b.getvalue()
 
 

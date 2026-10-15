@@ -357,15 +357,18 @@ def analysis_pdf(data, df, verified=None, report_date=None):
             cols = 3
         rows = (n + cols - 1) // cols
 
-        # Approximate the available vertical space below the title/subtitle, then maximize font size.
-        # Long names may wrap, so 3-column layouts use a slightly more conservative maximum.
-        available_h = 8.55 * inch
+        # Standardized fixed-size item boxes make wrapped product names unmistakably one item.
+        # Every cell has the same width and height; long names wrap inside their own bordered box.
+        available_h = 8.35 * inch
         row_h = available_h / max(rows, 1)
-        max_fs = 20 if cols == 1 else (17 if cols == 2 else 14.5)
-        fs = min(max_fs, max(9.0, (row_h / 1.35) - 2.0))
-        leading = fs * 1.12
-        pad = max(2.0, min(7.0, (row_h - leading) / 2.0))
-        item_style = ParagraphStyle("verified_item", parent=styles["BodyText"], fontName="Helvetica-Bold", fontSize=fs, leading=leading, textColor=DARK)
+        max_fs = 18 if cols == 1 else (15.5 if cols == 2 else 12.5)
+        # Reserve enough vertical room for a two-line product name in every box.
+        fs = min(max_fs, max(8.5, (row_h - 8.0) / 2.25))
+        leading = fs * 1.08
+        item_style = ParagraphStyle(
+            "verified_item", parent=styles["BodyText"], fontName="Helvetica-Bold",
+            fontSize=fs, leading=leading, textColor=DARK, alignment=TA_CENTER,
+        )
         grid=[]
         # Fill down each column so the list reads naturally top-to-bottom, then left-to-right.
         for r in range(rows):
@@ -375,12 +378,15 @@ def analysis_pdf(data, df, verified=None, report_date=None):
                 row.append(Paragraph(verified[idx], item_style) if idx < n else "")
             grid.append(row)
         usable=7.35*inch
-        vt=Table(grid, colWidths=[usable/cols]*cols)
+        vt=Table(grid, colWidths=[usable/cols]*cols, rowHeights=[row_h]*rows)
         vt.setStyle(TableStyle([
-            ("VALIGN",(0,0),(-1,-1),"TOP"),
-            ("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),8),
-            ("TOPPADDING",(0,0),(-1,-1),pad),("BOTTOMPADDING",(0,0),(-1,-1),pad),
-            ("LINEBELOW",(0,0),(-1,-1),.25,colors.HexColor("#DDDDDD")),
+            ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+            ("ALIGN",(0,0),(-1,-1),"CENTER"),
+            ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
+            ("TOPPADDING",(0,0),(-1,-1),3),("BOTTOMPADDING",(0,0),(-1,-1),3),
+            ("BOX",(0,0),(-1,-1),.65,colors.HexColor("#777777")),
+            ("INNERGRID",(0,0),(-1,-1),.45,colors.HexColor("#B5B5B5")),
+            ("ROWBACKGROUNDS",(0,0),(-1,-1),[colors.white,colors.HexColor("#F7F7F7")]),
         ]))
         story.append(vt)
 

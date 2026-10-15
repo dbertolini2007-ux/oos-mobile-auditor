@@ -211,13 +211,23 @@ def _product_key(x):
 
 
 def analysis_pdf(data, df, verified=None, report_date=None):
-    """Two-page OOS report: executive analysis + verified OOS item list."""
+    """Dynamic OOS report: 1–2 analysis pages plus a dedicated verified-OOS page."""
     b = io.BytesIO(); styles = getSampleStyleSheet()
     route_date = _route_date(data, report_date or date.today())
     title_style = ParagraphStyle("report_title", parent=styles["Title"], fontSize=20, leading=22, alignment=TA_CENTER, spaceAfter=2)
     date_style = ParagraphStyle("route_date", parent=styles["BodyText"], fontSize=10, leading=12, alignment=TA_CENTER, textColor=DARK, spaceAfter=1)
     sub_style = ParagraphStyle("report_sub", parent=styles["BodyText"], fontSize=8, leading=10, textColor=colors.HexColor("#555555"), alignment=TA_CENTER, spaceAfter=6)
-    h2 = ParagraphStyle("h2exec", parent=styles["Heading2"], fontSize=12.5, leading=14, textColor=DARK, spaceBefore=5, spaceAfter=4)
+    # Dynamically compact the executive page when there are many locations.
+    # Up to 16 locations is kept on one readable page; larger audits are intentionally
+    # split across two clean analysis pages rather than shrinking to illegible text.
+    location_count = len({str(o.get("account", "Unknown") or "Unknown").strip() for o in data.get("orders", [])})
+    compact_analysis = location_count >= 11
+    split_analysis = location_count > 16
+    h2 = ParagraphStyle("h2exec", parent=styles["Heading2"],
+                        fontSize=(10.5 if compact_analysis else 12.5),
+                        leading=(11.5 if compact_analysis else 14), textColor=DARK,
+                        spaceBefore=(2 if compact_analysis else 5),
+                        spaceAfter=(2 if compact_analysis else 4))
     doc = SimpleDocTemplate(b, pagesize=letter, leftMargin=28, rightMargin=28, topMargin=18, bottomMargin=18)
     story = [Paragraph("Out-of-Stock Analysis", title_style),
              Paragraph(f"Route Date: {route_date:%B %d, %Y}", date_style),
@@ -258,14 +268,15 @@ def analysis_pdf(data, df, verified=None, report_date=None):
     prod_oos_pct = (unique_oos / unique_products * 100) if unique_products else 0
 
     def kpi_table(headers, vals):
-        t=Table([headers, vals], colWidths=[1.79*inch]*4, rowHeights=[.29*inch,.34*inch])
+        t=Table([headers, vals], colWidths=[1.79*inch]*4,
+                rowHeights=([.24*inch,.29*inch] if compact_analysis else [.29*inch,.34*inch]))
         t.setStyle(TableStyle([
             ("BACKGROUND",(0,0),(-1,0),DARK),("TEXTCOLOR",(0,0),(-1,0),colors.white),
-            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,0),7.2),
+            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,0),(6.5 if compact_analysis else 7.2)),
             ("ALIGN",(0,0),(-1,-1),"CENTER"),("FONTNAME",(0,1),(-1,1),"Helvetica-Bold"),
-            ("FONTSIZE",(0,1),(-1,1),12.5),("BOX",(0,0),(-1,-1),.4,colors.grey),
+            ("FONTSIZE",(0,1),(-1,1),(10.8 if compact_analysis else 12.5)),("BOX",(0,0),(-1,-1),.4,colors.grey),
             ("INNERGRID",(0,0),(-1,-1),.25,colors.grey),("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
-        story.append(t); story.append(Spacer(1,4))
+        story.append(t); story.append(Spacer(1,(2 if compact_analysis else 4)))
 
     unit_pct = os_units/total_ordered*100 if total_ordered else 0
     kpi_table(["TOTAL UNITS ORDERED","OOS UNITS","OOS %","FALSE OOS UNITS"],
@@ -285,11 +296,17 @@ def analysis_pdf(data, df, verified=None, report_date=None):
             colWidths=[3.05*inch,1.08*inch,.95*inch,.95*inch,.85*inch], repeatRows=1)
     t.setStyle(TableStyle([
         ("BACKGROUND",(0,0),(-1,0),DARK),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
-        ("FONTSIZE",(0,0),(-1,-1),6.8),("GRID",(0,0),(-1,-1),.3,colors.HexColor("#AAAAAA")),
+        ("FONTSIZE",(0,0),(-1,-1),(5.6 if compact_analysis else 6.8)),("GRID",(0,0),(-1,-1),.3,colors.HexColor("#AAAAAA")),
         ("ROWBACKGROUNDS",(0,1),(-1,-2),[colors.white,LIGHT]),("BACKGROUND",(0,-1),(-1,-1),MID),("FONTNAME",(0,-1),(-1,-1),"Helvetica-Bold"),
-        ("TOPPADDING",(0,0),(-1,-1),3.2),("BOTTOMPADDING",(0,0),(-1,-1),3.2),("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+        ("TOPPADDING",(0,0),(-1,-1),(1.35 if compact_analysis else 3.2)),("BOTTOMPADDING",(0,0),(-1,-1),(1.35 if compact_analysis else 3.2)),("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
     story.append(t)
 
+    # For very large route days, start the second location table on a fresh page.
+    # This avoids an awkward partial table and keeps headers with their data.
+    if split_analysis:
+        story.append(PageBreak())
+        story.append(Paragraph("Out-of-Stock Analysis", title_style))
+        story.append(Paragraph(f"Route Date: {route_date:%B %d, %Y}", date_style))
     story.append(Paragraph("Out-of-Stock Percentage by Location", h2))
     loc=[]
     for account,v in loc_map.items():
@@ -301,14 +318,27 @@ def analysis_pdf(data, df, verified=None, report_date=None):
              colWidths=[3.25*inch,1.45*inch,1.45*inch,.85*inch], repeatRows=1)
     t2.setStyle(TableStyle([
         ("BACKGROUND",(0,0),(-1,0),DARK),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
-        ("FONTSIZE",(0,0),(-1,-1),6.8),("GRID",(0,0),(-1,-1),.3,colors.HexColor("#AAAAAA")),
+        ("FONTSIZE",(0,0),(-1,-1),(5.6 if compact_analysis else 6.8)),("GRID",(0,0),(-1,-1),.3,colors.HexColor("#AAAAAA")),
         ("ROWBACKGROUNDS",(0,1),(-1,-2),[colors.white,LIGHT]),("BACKGROUND",(0,-1),(-1,-1),MID),("FONTNAME",(0,-1),(-1,-1),"Helvetica-Bold"),
-        ("TOPPADDING",(0,0),(-1,-1),3.2),("BOTTOMPADDING",(0,0),(-1,-1),3.2),("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+        ("TOPPADDING",(0,0),(-1,-1),(1.35 if compact_analysis else 3.2)),("BOTTOMPADDING",(0,0),(-1,-1),(1.35 if compact_analysis else 3.2)),("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
     story.append(t2)
 
     # Page 2: authoritative Verified Outs list (Column A only).
     story.append(PageBreak())
-    verified = [str(x).strip() for x in (verified or []) if str(x).strip()]
+    # Clean the authoritative Column A list for display: remove duplicates case-insensitively,
+    # preserve first-seen order, and render every item in ALL CAPS.
+    verified_clean = []
+    seen_verified = set()
+    for x in (verified or []):
+        item = " ".join(str(x).strip().split())
+        if not item:
+            continue
+        key = item.casefold()
+        if key in seen_verified:
+            continue
+        seen_verified.add(key)
+        verified_clean.append(item.upper())
+    verified = verified_clean
     verified_title = ParagraphStyle("verified_title", parent=styles["Title"], fontSize=22, leading=25, alignment=TA_CENTER, spaceAfter=8)
     verified_sub = ParagraphStyle("verified_sub", parent=styles["BodyText"], fontSize=9, leading=11, alignment=TA_CENTER, textColor=colors.HexColor("#555555"), spaceAfter=14)
     story.append(Paragraph("VERIFIED OOS ITEMS", verified_title))
@@ -317,18 +347,24 @@ def analysis_pdf(data, df, verified=None, report_date=None):
     if not verified:
         story.append(Paragraph("No verified OOS items were found in Column A of the uploaded Verified Outs list.", styles["Heading2"]))
     else:
-        # Use 2 columns for shorter lists and 3 for larger lists; dynamically size text to keep the list on one page.
+        # Use up to 3 columns and choose the LARGEST practical bold font that fits one page.
         n = len(verified)
-        cols = 2 if n <= 30 else 3
-        rows = (n + cols - 1) // cols
-        if rows <= 14:
-            fs, leading, pad = 14, 16, 8
-        elif rows <= 18:
-            fs, leading, pad = 12, 14, 6
-        elif rows <= 23:
-            fs, leading, pad = 10.5, 12, 4.5
+        if n <= 16:
+            cols = 1
+        elif n <= 32:
+            cols = 2
         else:
-            fs, leading, pad = 9, 10.5, 3.5
+            cols = 3
+        rows = (n + cols - 1) // cols
+
+        # Approximate the available vertical space below the title/subtitle, then maximize font size.
+        # Long names may wrap, so 3-column layouts use a slightly more conservative maximum.
+        available_h = 8.55 * inch
+        row_h = available_h / max(rows, 1)
+        max_fs = 20 if cols == 1 else (17 if cols == 2 else 14.5)
+        fs = min(max_fs, max(9.0, (row_h / 1.35) - 2.0))
+        leading = fs * 1.12
+        pad = max(2.0, min(7.0, (row_h - leading) / 2.0))
         item_style = ParagraphStyle("verified_item", parent=styles["BodyText"], fontName="Helvetica-Bold", fontSize=fs, leading=leading, textColor=DARK)
         grid=[]
         # Fill down each column so the list reads naturally top-to-bottom, then left-to-right.

@@ -25,6 +25,8 @@ st.markdown("""
 div[data-testid="stFileUploader"] {border: 2px dashed #777; border-radius: 14px; padding: 8px;}
 .stButton button, .stDownloadButton button {min-height: 52px; font-size: 18px; border-radius: 12px; width: 100%;}
 [data-testid="stMetricValue"] {font-size: 28px;}
+.wtd-box {border:3px solid #2B2B2B; border-radius:14px; padding:14px 16px 10px 16px; margin:10px 0 20px 0; background:#F7F7F7;}
+.wtd-box h2 {margin:0 0 4px 0; font-size:1.35rem;}
 @media (max-width: 640px) {.block-container {padding-left:.8rem;padding-right:.8rem;} h1{font-size:1.8rem!important;}}
 </style>
 """, unsafe_allow_html=True)
@@ -334,7 +336,13 @@ def _secret(name, default=""):
     except Exception: return default
 
 def _github_history_config():
-    return (_secret("WTD_GITHUB_TOKEN"), _secret("WTD_GITHUB_REPO"), _secret("WTD_GITHUB_BRANCH","main"), _secret("WTD_GITHUB_PATH","data/oos_wtd_history.csv"))
+    # V15 accepts the simple GitHub secret names used during setup.
+    # The older WTD_* names remain supported for backward compatibility.
+    token = _secret("GITHUB_TOKEN") or _secret("WTD_GITHUB_TOKEN")
+    repo = _secret("GITHUB_DATA_REPO") or _secret("WTD_GITHUB_REPO")
+    branch = _secret("GITHUB_DATA_BRANCH") or _secret("WTD_GITHUB_BRANCH") or "main"
+    path = _secret("GITHUB_DATA_PATH") or _secret("WTD_GITHUB_PATH") or "oos_wtd_history.csv"
+    return token, repo, branch, path
 
 def _github_request(url, token, method="GET", payload=None):
     headers={"Authorization":f"Bearer {token}","Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28","User-Agent":"OOS-Mobile-Auditor"}
@@ -381,16 +389,33 @@ def merge_replace_day(history, today_df, report_date):
     return pd.concat(parts,ignore_index=True) if parts else t
 
 def current_history(report_date, data, df):
-    ordered_map={str(o.get("account","Unknown")):int(o.get("total_ordered",0) or 0) for o in data.get("orders",[])}
-    unique_map={str(o.get("account","Unknown")):len(set(norm(x) for x in o.get("all_products",[]) if str(x).strip())) for o in data.get("orders",[])}
+    """Build the persistent daily snapshot used by WTD reporting.
+
+    Stores OOS lines, zero-OOS locations, and a lightweight product catalog row for
+    every product seen on the route sheets. Catalog rows let the WTD first page
+    reproduce the daily Product Availability metrics without rereading old sheets.
+    """
+    orders=data.get("orders",[])
+    ordered_map={str(o.get("account","Unknown")):int(o.get("total_ordered",0) or 0) for o in orders}
+    product_map={}
+    for o in orders:
+        account=str(o.get("account","Unknown"))
+        product_map.setdefault(account,set())
+        for x in o.get("all_products",[]) or []:
+            if str(x).strip(): product_map[account].add(str(x).strip())
+    unique_map={a:len(v) for a,v in product_map.items()}
     rows=[]
     if len(df):
         for r in df.itertuples(index=False):
             rows.append({"Date":str(report_date),"Account":r.Account,"Picker":r.Picker,"Product":r.Product,"Qty":int(r.Qty),"Status":r.Status,"OrderedUnits":ordered_map.get(str(r.Account),0),"UniqueProducts":unique_map.get(str(r.Account),0)})
-    # Preserve locations with zero OOS so WTD ordered-unit and product-availability totals stay correct.
+    # Store product catalog rows for accurate WTD unique-product / availability KPIs.
+    for account, products in product_map.items():
+        for product in sorted(products):
+            rows.append({"Date":str(report_date),"Account":account,"Picker":"","Product":product,"Qty":0,"Status":"CATALOG","OrderedUnits":ordered_map.get(account,0),"UniqueProducts":unique_map.get(account,0)})
+    # Preserve locations with zero OOS and no parsed catalog products.
     present=set(df.Account.astype(str)) if len(df) else set()
     for account,ordered in ordered_map.items():
-        if account not in present:
+        if account not in present and not product_map.get(account):
             rows.append({"Date":str(report_date),"Account":account,"Picker":"","Product":"","Qty":0,"Status":"NO OOS","OrderedUnits":ordered,"UniqueProducts":unique_map.get(account,0)})
     return pd.DataFrame(rows)
 
@@ -432,11 +457,12 @@ def wtd_pdf(history, report_date):
     h2=ParagraphStyle("wh",parent=styles["Heading2"],fontSize=13,leading=15,spaceBefore=5,spaceAfter=5)
     story=[Paragraph("Week-to-Date Out-of-Stock Analysis",title),Paragraph(f"Report Date Range: {monday:%B %d, %Y} – {report_date:%B %d, %Y} (Monday–Friday)",sub)]
     ord_units=int(h[["Date","Account","OrderedUnits"]].drop_duplicates(["Date","Account"])["OrderedUnits"].sum()) if len(h) else 0
-    os_h=h[(h.Product.fillna("").astype(str).str.strip()!="") & (h.Status!="NO OOS")]
+    os_h=h[(h.Product.fillna("").astype(str).str.strip()!="") & (~h.Status.isin(["NO OOS","CATALOG"]))]
     os_units=int(os_h.Qty.sum()) if len(os_h) else 0
     false_h=os_h[os_h.Status=="FALSE OOS / PICKING EXCEPTION"]
-    # Product KPIs use distinct location/product pairs across the selected week.
-    hp=h[h.Product.fillna("").astype(str).str.strip()!=""].copy() if len(h) else h.copy()
+    # Catalog rows persist every route-sheet product, allowing exact WTD availability metrics.
+    catalog_h=h[(h.Product.fillna("").astype(str).str.strip()!="") & (h.Status=="CATALOG")].copy() if len(h) else h.copy()
+    hp=catalog_h if len(catalog_h) else h[(h.Product.fillna("").astype(str).str.strip()!="") & (~h.Status.isin(["NO OOS"]))].copy()
     unique_products=int(hp.Product.nunique()) if len(hp) else 0
     unique_oos=int(os_h.Product.nunique()) if len(os_h) else 0
     instock=(unique_products-unique_oos)/unique_products if unique_products else 0
@@ -449,8 +475,8 @@ def wtd_pdf(history, report_date):
     story.append(Paragraph("Product Availability by Location",h2))
     avail=[]
     for account,g in h.groupby("Account") if len(h) else []:
-        # Sum daily unique-product counts if present; for WTD we use max product assortment seen at that location during week.
-        up=int(pd.to_numeric(g.get("UniqueProducts",pd.Series([0])),errors="coerce").fillna(0).max())
+        cg=catalog_h[catalog_h.Account==account] if len(catalog_h) else pd.DataFrame()
+        up=int(cg.Product.nunique()) if len(cg) else int(pd.to_numeric(g.get("UniqueProducts",pd.Series([0])),errors="coerce").fillna(0).max())
         go=os_h[os_h.Account==account] if len(os_h) else os_h
         uo=int(go.Product.nunique()) if len(go) else 0
         avail.append([account,up,uo,f"{((up-uo)/up*100 if up else 0):.2f}%",f"{(uo/up*100 if up else 0):.2f}%"])
@@ -615,10 +641,45 @@ def excel_export(report_date, data, df, history):
 
 
 st.title("📦 OOS Auditor")
-st.caption("Phone-first pick-sheet audit for Android, iPhone and desktop.")
+st.caption("Phone-first pick-sheet audit for Android, iPhone and desktop. • V15")
 with st.expander("How it works", expanded=False):
     st.write("Column A of Verified Outs = verified OOS. Column B is notes only. An OS on a pick sheet that is not in Column A becomes a picking exception.")
 
+# WEEK-TO-DATE is intentionally separated at the top so managers can run it
+# without uploading or reprocessing today's route sheets.
+st.markdown('<div class="wtd-box"><h2>📊 WEEK-TO-DATE REPORT</h2><b>Run the stored Monday–Friday report without uploading pick sheets.</b></div>', unsafe_allow_html=True)
+wtd_end_date=st.date_input("WTD report through", value=date.today(), key="wtd_end_date")
+wtd_token, wtd_repo, wtd_branch, wtd_path = _github_history_config()
+wtd_persistent_configured=bool(wtd_token and wtd_repo)
+if wtd_persistent_configured:
+    st.caption("✅ Shared WTD storage is configured.")
+else:
+    st.caption("⚠️ Shared WTD storage is not configured yet. WTD can only use audits retained in this browser session until the storage secrets are added.")
+
+if st.button("📊 RUN / DOWNLOAD WEEK-TO-DATE", type="primary", use_container_width=True, key="run_wtd_only"):
+    try:
+        stored_history, persistent_enabled = load_persistent_history()
+        history_for_wtd = stored_history if persistent_enabled else st.session_state.get("wtd_history", pd.DataFrame())
+        wtd_rows = filter_wtd(history_for_wtd, wtd_end_date) if history_for_wtd is not None and len(history_for_wtd) else pd.DataFrame()
+        if len(wtd_rows):
+            st.session_state["standalone_wtd_pdf"] = wtd_pdf(history_for_wtd, wtd_end_date)
+            st.session_state["standalone_wtd_end"] = wtd_end_date
+            st.session_state["standalone_wtd_count"] = int(pd.to_datetime(wtd_rows["Date"]).dt.date.nunique())
+            st.success(f"WTD report ready — {st.session_state['standalone_wtd_count']} stored workday(s) included.")
+        else:
+            st.session_state.pop("standalone_wtd_pdf", None)
+            st.warning("No stored audits were found for this Monday–Friday date range.")
+    except Exception as e:
+        st.error("Could not load the stored WTD data.")
+        st.caption(f"Technical detail: {type(e).__name__}: {str(e)[:300]}")
+
+if "standalone_wtd_pdf" in st.session_state:
+    _wtd_end=st.session_state.get("standalone_wtd_end", wtd_end_date)
+    _wtd_mon=_wtd_end-timedelta(days=_wtd_end.weekday())
+    st.download_button("⬇️ DOWNLOAD WEEK-TO-DATE OOS PDF", st.session_state["standalone_wtd_pdf"], f"OOS_WTD_{_wtd_mon}_to_{_wtd_end}.pdf", "application/pdf", use_container_width=True)
+
+st.markdown("---")
+st.markdown("## 🧾 RUN DAILY OOS AUDIT")
 report_date=st.date_input("Audit date",value=date.today())
 
 # Pick sheets: employees can either take photos directly or select existing pictures/PDFs.

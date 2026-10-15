@@ -1,6 +1,7 @@
-streamlit>=1.40
-openai>=2.0
-pandas>=2.2
-openpyxl>=3.1
-xlrd>=2.0
-reportlab>=4.2
+streamlit
+openai
+pandas
+reportlab
+openpyxl
+xlrd
+Pillow

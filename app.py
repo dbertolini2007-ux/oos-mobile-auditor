@@ -210,8 +210,8 @@ def _product_key(x):
     return norm(x)
 
 
-def analysis_pdf(data, df, report_date=None):
-    """One-page executive OOS report matching the approved example layout."""
+def analysis_pdf(data, df, verified=None, report_date=None):
+    """Two-page OOS report: executive analysis + verified OOS item list."""
     b = io.BytesIO(); styles = getSampleStyleSheet()
     route_date = _route_date(data, report_date or date.today())
     title_style = ParagraphStyle("report_title", parent=styles["Title"], fontSize=20, leading=22, alignment=TA_CENTER, spaceAfter=2)
@@ -305,6 +305,49 @@ def analysis_pdf(data, df, report_date=None):
         ("ROWBACKGROUNDS",(0,1),(-1,-2),[colors.white,LIGHT]),("BACKGROUND",(0,-1),(-1,-1),MID),("FONTNAME",(0,-1),(-1,-1),"Helvetica-Bold"),
         ("TOPPADDING",(0,0),(-1,-1),3.2),("BOTTOMPADDING",(0,0),(-1,-1),3.2),("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
     story.append(t2)
+
+    # Page 2: authoritative Verified Outs list (Column A only).
+    story.append(PageBreak())
+    verified = [str(x).strip() for x in (verified or []) if str(x).strip()]
+    verified_title = ParagraphStyle("verified_title", parent=styles["Title"], fontSize=22, leading=25, alignment=TA_CENTER, spaceAfter=8)
+    verified_sub = ParagraphStyle("verified_sub", parent=styles["BodyText"], fontSize=9, leading=11, alignment=TA_CENTER, textColor=colors.HexColor("#555555"), spaceAfter=14)
+    story.append(Paragraph("VERIFIED OOS ITEMS", verified_title))
+    story.append(Paragraph(f"Route Date: {route_date:%B %d, %Y} &nbsp;&nbsp;|&nbsp;&nbsp; Verified Outs — Column A", verified_sub))
+
+    if not verified:
+        story.append(Paragraph("No verified OOS items were found in Column A of the uploaded Verified Outs list.", styles["Heading2"]))
+    else:
+        # Use 2 columns for shorter lists and 3 for larger lists; dynamically size text to keep the list on one page.
+        n = len(verified)
+        cols = 2 if n <= 30 else 3
+        rows = (n + cols - 1) // cols
+        if rows <= 14:
+            fs, leading, pad = 14, 16, 8
+        elif rows <= 18:
+            fs, leading, pad = 12, 14, 6
+        elif rows <= 23:
+            fs, leading, pad = 10.5, 12, 4.5
+        else:
+            fs, leading, pad = 9, 10.5, 3.5
+        item_style = ParagraphStyle("verified_item", parent=styles["BodyText"], fontName="Helvetica-Bold", fontSize=fs, leading=leading, textColor=DARK)
+        grid=[]
+        # Fill down each column so the list reads naturally top-to-bottom, then left-to-right.
+        for r in range(rows):
+            row=[]
+            for c in range(cols):
+                idx=c*rows+r
+                row.append(Paragraph(verified[idx], item_style) if idx < n else "")
+            grid.append(row)
+        usable=7.35*inch
+        vt=Table(grid, colWidths=[usable/cols]*cols)
+        vt.setStyle(TableStyle([
+            ("VALIGN",(0,0),(-1,-1),"TOP"),
+            ("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),8),
+            ("TOPPADDING",(0,0),(-1,-1),pad),("BOTTOMPADDING",(0,0),(-1,-1),pad),
+            ("LINEBELOW",(0,0),(-1,-1),.25,colors.HexColor("#DDDDDD")),
+        ]))
+        story.append(vt)
+
     doc.build(story)
     return b.getvalue()
 
@@ -790,7 +833,7 @@ if "data" in st.session_state:
         st.warning(f"WTD permanent storage is temporarily unavailable; this audit is retained for this session. {type(e).__name__}")
     monday=rd-timedelta(days=rd.weekday()); wtd=filter_wtd(history, rd)
     st.subheader("Download Reports")
-    st.download_button("⬇️ OOS ANALYSIS — ONE-PAGE REPORT",analysis_pdf(data,df,rd),f"OOS_Analysis_{rd}.pdf","application/pdf")
+    st.download_button("⬇️ OOS ANALYSIS + VERIFIED OOS ITEMS",analysis_pdf(data,df,vo,rd),f"OOS_Analysis_{rd}.pdf","application/pdf")
     st.download_button("⬇️ FALSE OOS — REPICK LIST",repick_pdf(df),f"False_OOS_Repick_{rd}.pdf","application/pdf")
     st.download_button("⬇️ WEEK-TO-DATE OOS PDF",wtd_pdf(history,rd),f"OOS_WTD_{monday}_to_{rd}.pdf","application/pdf")
     st.download_button("⬇️ COMPLETE EXCEL WORKBOOK",excel_export(rd,data,df,history),f"OOS_Audit_{rd}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",help="One workbook containing daily summaries, item quantity/frequency, false OOS repick, detailed audit data and WTD analysis.")

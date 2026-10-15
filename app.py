@@ -1,4 +1,4 @@
-import os, io, re, json, tempfile, base64, hashlib, urllib.request, urllib.error
+import os, io, re, json, tempfile, base64, hashlib, hmac, urllib.request, urllib.error
 from datetime import date, timedelta
 from difflib import SequenceMatcher
 import streamlit as st
@@ -17,7 +17,7 @@ try:
 except Exception:
     Image = None
 
-st.set_page_config(page_title="OOS Auditor", page_icon="📦", layout="centered")
+st.set_page_config(page_title="OOS Auditor", page_icon="📦", layout="centered", initial_sidebar_state="collapsed")
 
 st.markdown("""
 <style>
@@ -28,8 +28,48 @@ div[data-testid="stFileUploader"] {border: 2px dashed #777; border-radius: 14px;
 .wtd-box {border:3px solid #2B2B2B; border-radius:14px; padding:14px 16px 10px 16px; margin:10px 0 20px 0; background:#F7F7F7;}
 .wtd-box h2 {margin:0 0 4px 0; font-size:1.35rem;}
 @media (max-width: 640px) {.block-container {padding-left:.8rem;padding-right:.8rem;} h1{font-size:1.8rem!important;}}
+#MainMenu {visibility:hidden;}
+footer {visibility:hidden;}
+header[data-testid="stHeader"] {background:transparent;}
+[data-testid="stToolbar"] {visibility:hidden;}
 </style>
 """, unsafe_allow_html=True)
+
+# Employee access gate. The password is kept in Streamlit Secrets, never in this public app file.
+def _secret(name, default=""):
+    try:
+        return str(st.secrets.get(name, default))
+    except Exception:
+        return default
+
+def _require_login():
+    expected_user = _secret("APP_USERNAME", "OOS")
+    expected_password = _secret("APP_PASSWORD", "")
+    if not expected_password:
+        st.title("📦 OOS Auditor")
+        st.error("App access has not been configured by the administrator.")
+        st.stop()
+
+    if st.session_state.get("oos_authenticated"):
+        return
+
+    st.title("📦 OOS Auditor")
+    st.caption("Authorized employees only")
+    with st.form("oos_login", clear_on_submit=False):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("SIGN IN", use_container_width=True)
+    if submitted:
+        good_user = hmac.compare_digest(username.strip(), expected_user)
+        good_password = hmac.compare_digest(password, expected_password)
+        if good_user and good_password:
+            st.session_state["oos_authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect username or password.")
+    st.stop()
+
+_require_login()
 
 DARK = colors.HexColor("#2B2B2B")
 LIGHT = colors.HexColor("#F2F2F2")
@@ -725,8 +765,14 @@ def excel_export(report_date, data, df, history):
     return out.getvalue()
 
 
-st.title("📦 OOS Auditor")
-st.caption("Phone-first pick-sheet audit for Android, iPhone and desktop. • V15")
+c_title, c_logout = st.columns([4,1])
+with c_title:
+    st.title("📦 OOS Auditor")
+with c_logout:
+    if st.button("SIGN OUT", use_container_width=True):
+        st.session_state["oos_authenticated"] = False
+        st.rerun()
+st.caption("Mobile pick-sheet auditing and out-of-stock reporting")
 with st.expander("How it works", expanded=False):
     st.write("Column A of Verified Outs = verified OOS. Column B is notes only. An OS on a pick sheet that is not in Column A becomes a picking exception.")
 
@@ -756,7 +802,6 @@ if st.button("📊 RUN / DOWNLOAD WEEK-TO-DATE", type="primary", use_container_w
             st.warning("No stored audits were found for this Monday–Friday date range.")
     except Exception as e:
         st.error("Could not load the stored WTD data.")
-        st.caption(f"Technical detail: {type(e).__name__}: {str(e)[:300]}")
 
 if "standalone_wtd_pdf" in st.session_state:
     _wtd_end=st.session_state.get("standalone_wtd_end", wtd_end_date)
@@ -823,13 +868,13 @@ verified_file=st.file_uploader("Upload Verified Outs",type=["xlsx","xls","csv","
 
 with st.expander("Manager settings"):
     threshold=st.slider("Product match threshold",.70,1.0,.86,.01)
-    model=st.selectbox("Reading model",["gpt-6.1-sol","gpt-6-luna"],index=0)
+model=_secret("READING_MODEL", "gpt-6.1-sol")
 
 api_key=os.getenv("OPENAI_API_KEY","")
 if not api_key:
     try: api_key=st.secrets["OPENAI_API_KEY"]
     except Exception: api_key=""
-if not api_key: st.error("Server setup required: OPENAI_API_KEY has not been configured. Employees should never enter the API key.")
+if not api_key: st.error("The document-reading service is not configured. Contact the administrator.")
 
 if st.button("RUN AUDIT",type="primary",disabled=not(pick and verified_file and api_key)):
     client=OpenAI(api_key=api_key)
@@ -841,7 +886,6 @@ if st.button("RUN AUDIT",type="primary",disabled=not(pick and verified_file and 
             st.session_state.update({"data":data,"vo":vo,"report_date":route_rd}); s.update(label="Audit ready",state="complete")
     except Exception as e:
         st.error("The audit reader could not process one of the uploads. Try again, or use a clear JPG/PNG photo or PDF.")
-        st.caption(f"Technical detail: {type(e).__name__}: {str(e)[:500]}")
 
 if "data" in st.session_state:
     data=st.session_state["data"]; vo=st.session_state["vo"]; rd=st.session_state.get("report_date",report_date)

@@ -35,7 +35,7 @@ def catalog_from_excel(file):
             if not id_col or not desc_col:
                 continue
             result = pd.DataFrame({
-                "RuthID": data[id_col].astype(str).str.replace(r"\\.0$", "", regex=True).str.strip(),
+                "RuthID": data[id_col].astype(str).str.replace(r"\.0$", "", regex=True).str.strip(),
                 "Item": data[desc_col].fillna("").astype(str).str.strip(),
                 "Category": data[mapping["CATGRY"]].fillna("").astype(str) if "CATGRY" in mapping else "",
                 "Vendor": data[mapping["VENDOR"]].fillna("").astype(str) if "VENDOR" in mapping else "",
@@ -46,7 +46,7 @@ def catalog_from_excel(file):
     if not frames:
         raise ValueError("Catalog must contain RuthID and Item columns.")
     out = pd.concat(frames, ignore_index=True)
-    return out[out.RuthID.str.fullmatch(r"\\d+") & out.Item.ne("")].drop_duplicates("RuthID")
+    return out[out.RuthID.str.fullmatch(r"\d+") & out.Item.ne("")].drop_duplicates("RuthID")
 
 
 def best_match(description, catalog):
@@ -66,7 +66,7 @@ def candidates(item, catalog, excluded, account_picklist=None):
         return orig, []
 
     def size(text):
-        match = re.search(r"(\\d+(?:\\.\\d+)?)\\s*(OZ|OUNCE|OUNCES|FL OZ|ML|G|GRAM|GRAMS|LB)\\b", clean(text))
+        match = re.search(r"(\d+(?:\.\d+)?)\s*(OZ|OUNCE|OUNCES|FL OZ|ML|G|GRAM|GRAMS|LB)\b", clean(text))
         if not match:
             return None
         value, unit = float(match.group(1)), match.group(2)

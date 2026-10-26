@@ -57,7 +57,7 @@ def best_match(description, catalog):
     return scores.iloc[0] if len(scores) else None
 
 
-def candidates(item, catalog, excluded):
+def candidates(item, catalog, excluded, account_picklist=None):
     orig = best_match(item, catalog)
     if orig is None:
         return None, []
@@ -94,7 +94,14 @@ def candidates(item, catalog, excluded):
                 (0.25 if same_category else -0.15) + size_bonus)
 
     pool["MatchScore"] = pool.apply(score, axis=1)
-    return orig, pool.sort_values("MatchScore", ascending=False).head(8).to_dict("records")
+    same_category = pool[pool.Category.map(clean).eq(clean(orig.Category))] if clean(orig.Category) else pool
+    ranked = same_category.sort_values("MatchScore", ascending=False).head(5).copy()
+    if ranked.empty:
+        return orig, []
+    ordered = {clean(x) for x in (account_picklist or []) if clean(x)}
+    ranked["AlreadyOnPicklist"] = ranked.Item.map(lambda x: clean(x) in ordered)
+    ranked = ranked.sort_values(["AlreadyOnPicklist", "MatchScore"], ascending=[True, False])
+    return orig, ranked.to_dict("records")
 
 def pdf_report(rows, report_date):
     buf = io.BytesIO()
@@ -131,7 +138,7 @@ def pdf_report(rows, report_date):
     return buf.getvalue()
 
 
-def render_report_4(df, rd):
+def render_report_4(df, rd, data=None):
     st.markdown("### Report #4 — Suggested Substitution Picklist (Optional)")
     st.caption("Only VERIFIED OOS rows are eligible. Confirm product identity and replacement suitability before printing.")
     upload = st.file_uploader("Product catalog (ITEMS.xlsx)", type=["xlsx"], key="sub_catalog")
@@ -152,9 +159,15 @@ def render_report_4(df, rd):
         original = best_match(product, catalog)
         if original is not None:
             excluded.add(str(original.RuthID))
+    account_products = {}
+    for order in (data or {}).get("orders", []):
+        account = clean(order.get("account", "Unknown"))
+        account_products.setdefault(account, set()).update(
+            clean(x) for x in (order.get("all_products") or []) if clean(x)
+        )
     rows = []
     for n, item in enumerate(verified.itertuples(index=False)):
-        orig, choices = candidates(item.Product, catalog, excluded)
+        orig, choices = candidates(item.Product, catalog, excluded, account_products.get(clean(item.Account), set()))
         original_id = str(orig.RuthID) if orig is not None else "UNMATCHED"
         # Require explicit employee approval, including for the top-ranked suggestion.
         options = ["NO SUBSTITUTION"] + [str(x["RuthID"]) + " | " + str(x["Item"]) for x in choices]

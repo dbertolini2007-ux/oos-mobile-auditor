@@ -141,9 +141,10 @@ def pdf_report(rows, report_date):
 def render_report_4(df, rd, data=None):
     st.markdown("### Report #4 — Suggested Substitution Picklist (Optional)")
     st.caption("Only VERIFIED OOS rows are eligible. Confirm product identity and replacement suitability before printing.")
-    upload = st.file_uploader("Product catalog (ITEMS.xlsx)", type=["xlsx"], key="sub_catalog")
+    upload = st.file_uploader("Product catalog (ITEMS.xlsx) — upload once per session", type=["xlsx"], key="sub_catalog")
     if upload is None:
-        st.info("Upload the product catalog to enable substitution suggestions.")
+        st.download_button("⬇️ REPORT #4 — SUGGESTED SUBSTITUTION PICKLIST", data=b"", file_name="OOS_Substitutions.pdf", mime="application/pdf", disabled=True)
+        st.info("Report #4 is not ready: upload ITEMS.xlsx above to generate and approve substitutions.")
         return
     try:
         catalog = catalog_from_excel(upload)
@@ -152,6 +153,7 @@ def render_report_4(df, rd, data=None):
         return
     verified = df[df["Status"].eq("VERIFIED OOS")].copy() if len(df) else pd.DataFrame()
     if verified.empty:
+        st.download_button("⬇️ REPORT #4 — SUGGESTED SUBSTITUTION PICKLIST", data=b"", file_name="OOS_Substitutions.pdf", mime="application/pdf", disabled=True)
         st.info("No confirmed verified OOS lines to substitute.")
         return
     excluded = set()
@@ -181,9 +183,8 @@ def render_report_4(df, rd, data=None):
             rows.append({"Account": item.Account, "Qty": int(item.Qty), "Product": item.Product,
                          "OriginalRuthID": original_id, "ReplacementRuthID": replacement_id,
                          "ReplacementItem": replacement.Item})
-    if rows:
-        st.download_button("⬇️ REPORT #4 — DOWNLOAD SUGGESTED SUBSTITUTION PICKLIST",
-                           pdf_report(rows, rd), f"OOS_Substitutions_{rd}.pdf", "application/pdf",
-                           use_container_width=True)
-    else:
+    st.download_button("⬇️ REPORT #4 — SUGGESTED SUBSTITUTION PICKLIST",
+                       pdf_report(rows, rd) if rows else b"", f"OOS_Substitutions_{rd}.pdf", "application/pdf",
+                       disabled=not bool(rows), use_container_width=True)
+    if not rows:
         st.caption("Choose and approve at least one substitution to enable the PDF.")

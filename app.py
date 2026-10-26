@@ -966,4 +966,4 @@ if "data" in st.session_state:
 # Optional Report #4. Isolated from Reports #1–3 and the Excel export.
 if 'data' in st.session_state:
     from substitution_report import render_report_4
-    render_report_4(df, rd)
+    render_report_4(df, rd, data)

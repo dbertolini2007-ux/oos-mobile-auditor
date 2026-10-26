@@ -152,9 +152,22 @@ def render_report_4(df, rd, data=None):
         st.error(f"Cannot read catalog: {e}")
         return
     verified = df[df["Status"].eq("VERIFIED OOS")].copy() if len(df) else pd.DataFrame()
+    review = df[df["Status"].eq("NEEDS REVIEW")].copy() if len(df) else pd.DataFrame()
+    if not review.empty:
+        st.warning(f"{len(review)} OOS line(s) require verification. They will NOT be treated as confirmed shortages unless you explicitly approve them.")
+        approved_indices = []
+        with st.expander("Review uncertain OOS lines for Report #4", expanded=verified.empty):
+            for idx, line in review.iterrows():
+                if st.checkbox(
+                    f"Confirm actual OOS: {line['Account']} — {line['Product']} (Qty {int(line['Qty'])})",
+                    key=f"sub_confirm_oos_{idx}", value=False
+                ):
+                    approved_indices.append(idx)
+        if approved_indices:
+            verified = pd.concat([verified, review.loc[approved_indices]], ignore_index=True)
     if verified.empty:
         st.download_button("⬇️ REPORT #4 — SUGGESTED SUBSTITUTION PICKLIST", data=b"", file_name="OOS_Substitutions.pdf", mime="application/pdf", disabled=True)
-        st.info("No confirmed verified OOS lines to substitute.")
+        st.info("No verified OOS lines selected. Confirm actual OOS items above to enable Report #4.")
         return
     excluded = set()
     for product in verified.Product.unique():

@@ -62,20 +62,39 @@ def candidates(item, catalog, excluded):
     if orig is None:
         return None, []
     pool = catalog[~catalog.RuthID.isin(excluded | {orig.RuthID})].copy()
-    if not len(pool):
+    if pool.empty:
         return orig, []
-    orig_words = set(clean(orig.Item).split())
+
+    def size(text):
+        match = re.search(r"(\\d+(?:\\.\\d+)?)\\s*(OZ|OUNCE|OUNCES|FL OZ|ML|G|GRAM|GRAMS|LB)\\b", clean(text))
+        if not match:
+            return None
+        value, unit = float(match.group(1)), match.group(2)
+        if unit in ("OUNCE", "OUNCES", "FL OZ"):
+            unit = "OZ"
+        if unit in ("GRAM", "GRAMS"):
+            unit = "G"
+        return value, unit
+
+    original_words = set(clean(orig.Item).split())
+    original_size = size(orig.Item)
     def score(row):
         words = set(clean(row.Item).split())
+        overlap = len(original_words & words) / max(1, len(original_words | words))
         similarity = SequenceMatcher(None, clean(orig.Item), clean(row.Item)).ratio()
-        category = 0.22 if clean(row.Category) and clean(row.Category) == clean(orig.Category) else 0
-        vendor = 0.12 if clean(row.Vendor) and clean(row.Vendor) == clean(orig.Vendor) else 0
-        case = 0.06 if row.UnitsPerCase and row.UnitsPerCase == orig.UnitsPerCase else 0
-        shared = 0.10 * len(orig_words & words) / max(1, len(orig_words))
-        return similarity + category + vendor + case + shared
+        same_category = bool(clean(orig.Category) and clean(row.Category) == clean(orig.Category))
+        candidate_size = size(row.Item)
+        size_bonus = 0
+        if original_size and candidate_size and original_size[1] == candidate_size[1]:
+            ratio = min(original_size[0], candidate_size[0]) / max(original_size[0], candidate_size[0])
+            size_bonus = 0.30 * ratio
+        elif original_size and candidate_size:
+            size_bonus = -0.10
+        return (0.50 * overlap + 0.25 * similarity +
+                (0.25 if same_category else -0.15) + size_bonus)
+
     pool["MatchScore"] = pool.apply(score, axis=1)
     return orig, pool.sort_values("MatchScore", ascending=False).head(8).to_dict("records")
-
 
 def pdf_report(rows, report_date):
     buf = io.BytesIO()

@@ -961,3 +961,9 @@ if "data" in st.session_state:
     st.caption(f"WTD window: {monday:%A %m/%d} through {rd:%A %m/%d}. Saturday/Sunday records are excluded.")
     if st.session_state.get("wtd_storage_mode")=="persistent": st.caption("✅ WTD data saved centrally. Re-running the same route date replaces that day instead of duplicating it.")
     else: st.caption("ℹ️ WTD is currently session-only. Configure private persistent storage secrets to retain data across Streamlit restarts and for all team members.")
+
+
+# Optional Report #4. Isolated from Reports #1–3 and the Excel export.
+if 'data' in st.session_state:
+    from substitution_report import render_report_4
+    render_report_4(df, rd, data)

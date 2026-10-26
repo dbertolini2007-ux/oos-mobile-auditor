@@ -138,9 +138,9 @@ def pdf_report(rows, report_date):
     return buf.getvalue()
 
 
-def render_report_4(df, rd, data=None):
+def render_report_4(df, rd, data=None, verified_outs=None):
     st.markdown("### Report #4 — Suggested Substitution Picklist (Optional)")
-    st.caption("Only VERIFIED OOS rows are eligible. Confirm product identity and replacement suitability before printing.")
+    st.caption("Uses Verified Outs Column A. Review suggested replacements, location, and quantity before printing.")
     upload = st.file_uploader("Product catalog (ITEMS.xlsx) — upload once per session", type=["xlsx"], key="sub_catalog")
     if upload is None:
         st.download_button("⬇️ REPORT #4 — SUGGESTED SUBSTITUTION PICKLIST", data=b"", file_name="OOS_Substitutions.pdf", mime="application/pdf", disabled=True)
@@ -151,24 +151,31 @@ def render_report_4(df, rd, data=None):
     except Exception as e:
         st.error(f"Cannot read catalog: {e}")
         return
-    verified = df[df["Status"].eq("VERIFIED OOS")].copy() if len(df) else pd.DataFrame()
-    review = df[df["Status"].eq("NEEDS REVIEW")].copy() if len(df) else pd.DataFrame()
-    if not review.empty:
-        st.warning(f"{len(review)} OOS line(s) require verification. They will NOT be treated as confirmed shortages unless you explicitly approve them.")
-        approved_indices = []
-        with st.expander("Review uncertain OOS lines for Report #4", expanded=verified.empty):
-            for idx, line in review.iterrows():
-                if st.checkbox(
-                    f"Confirm actual OOS: {line['Account']} — {line['Product']} (Qty {int(line['Qty'])})",
-                    key=f"sub_confirm_oos_{idx}", value=False
-                ):
-                    approved_indices.append(idx)
-        if approved_indices:
-            verified = pd.concat([verified, review.loc[approved_indices]], ignore_index=True)
+    # Verified Outs column A is the source of truth, independent of the
+    # confidence-based audit status. Do not promote FALSE OOS rows.
+    verified_names = [str(x).strip() for x in (verified_outs or []) if str(x).strip()]
+    audit_rows = df[df["Status"].eq("VERIFIED OOS")].copy() if len(df) else pd.DataFrame()
+    verified_rows = []
+    for name in verified_names:
+        matching = audit_rows[audit_rows.Product.map(
+            lambda x: SequenceMatcher(None, clean(x), clean(name)).ratio() >= 0.75
+        )] if not audit_rows.empty else pd.DataFrame()
+        if not matching.empty:
+            for _, line in matching.iterrows():
+                verified_rows.append({"Account": line["Account"], "Picker": line.get("Picker", ""),
+                                      "Product": name, "Qty": max(1, int(line["Qty"]))})
+        else:
+            verified_rows.append({"Account": "WAREHOUSE / LOCATION TO CONFIRM",
+                                  "Picker": "", "Product": name, "Qty": 1})
+    verified = pd.DataFrame(verified_rows)
     if verified.empty:
-        st.download_button("⬇️ REPORT #4 — SUGGESTED SUBSTITUTION PICKLIST", data=b"", file_name="OOS_Substitutions.pdf", mime="application/pdf", disabled=True)
-        st.info("No verified OOS lines selected. Confirm actual OOS items above to enable Report #4.")
+        st.download_button("⬇️ REPORT #4 — SUGGESTED SUBSTITUTION PICKLIST",
+                           data=b"", file_name="OOS_Substitutions.pdf",
+                           mime="application/pdf", disabled=True)
+        st.info("No products found in Verified Outs Column A. Upload a verified-outs list and run the audit.")
         return
+    if any(verified.Account.eq("WAREHOUSE / LOCATION TO CONFIRM")):
+        st.info("Items not matched to a verified pick-sheet line are grouped under WAREHOUSE / LOCATION TO CONFIRM with quantity 1. Review quantities and locations before use.")
     excluded = set()
     for product in verified.Product.unique():
         original = best_match(product, catalog)

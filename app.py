@@ -958,7 +958,7 @@ if "data" in st.session_state:
     st.download_button("⬇️ FALSE OOS — REPICK LIST",repick_pdf(df),f"False_OOS_Repick_{rd}.pdf","application/pdf")
     st.download_button("⬇️ WEEK-TO-DATE OOS PDF",wtd_pdf(history,rd),f"OOS_WTD_{monday}_to_{rd}.pdf","application/pdf")
     from substitution_report import render_report_4
-    render_report_4(df, rd, data)
+    render_report_4(df, rd, data, vo)
     st.download_button("⬇️ COMPLETE EXCEL WORKBOOK",excel_export(rd,data,df,history),f"OOS_Audit_{rd}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",help="One workbook containing daily summaries, item quantity/frequency, false OOS repick, detailed audit data and WTD analysis.")
     st.caption(f"WTD window: {monday:%A %m/%d} through {rd:%A %m/%d}. Saturday/Sunday records are excluded.")
     if st.session_state.get("wtd_storage_mode")=="persistent": st.caption("✅ WTD data saved centrally. Re-running the same route date replaces that day instead of duplicating it.")
